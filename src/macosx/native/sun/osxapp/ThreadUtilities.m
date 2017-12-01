@@ -36,7 +36,7 @@ static JNIEnv *appKitEnv = NULL;
 static jobject appkitThreadGroup = NULL;
 static BOOL awtEmbedded = NO;
 
-inline void attachCurrentThread(void** env) {
+static inline void attachCurrentThread(void** env) {
     if ([NSThread isMainThread]) {
         JavaVMAttachArgs args;
         args.version = JNI_VERSION_1_4;
@@ -74,9 +74,9 @@ AWT_ASSERT_APPKIT_THREAD;
 
 + (void)performOnMainThreadWaiting:(BOOL)wait block:(void (^)())block {
     if ([NSThread isMainThread] && wait == YES) {
-        block(); 
-    } else { 
-        [JNFRunLoop performOnMainThreadWaiting:wait withBlock:block]; 
+        block();
+    } else {
+        [JNFRunLoop performOnMainThreadWaiting:wait withBlock:block];
     }
 }
 
@@ -103,4 +103,3 @@ void OSXAPP_SetJavaVM(JavaVM *vm)
 {
     jvm = vm;
 }
-
