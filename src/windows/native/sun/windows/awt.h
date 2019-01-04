@@ -44,14 +44,18 @@
 
 extern COLORREF DesktopColor2RGB(int colorIndex);
 
-#ifndef _WIN32_WINNT_WINBLUE
+
+//#ifndef _WIN32_WINNT_WINBLUE
+// TODO: What is about ShellScalingAPI.h
 typedef enum _PROCESS_DPI_AWARENESS {
     PROCESS_DPI_UNAWARE            = 0,
     PROCESS_SYSTEM_DPI_AWARE       = 1,
     PROCESS_PER_MONITOR_DPI_AWARE  = 2
 } PROCESS_DPI_AWARENESS;
-#endif
+//#endif
 
+
+/*
 #ifndef _WIN32_WINNT_WIN10
 typedef enum _DPI_AWARENESS {
     DPI_AWARENESS_INVALID            = -1,
@@ -59,22 +63,14 @@ typedef enum _DPI_AWARENESS {
     DPI_AWARENESS_SYSTEM_AWARE       = 1,
     DPI_AWARENESS_PER_MONITOR_AWARE  = 2
 } DPI_AWARENESS;
-
-DECLARE_HANDLE(DPI_AWARENESS_CONTEXT);
-
-#define DPI_AWARENESS_CONTEXT_UNAWARE              ((DPI_AWARENESS_CONTEXT)-1)
-#define DPI_AWARENESS_CONTEXT_SYSTEM_AWARE         ((DPI_AWARENESS_CONTEXT)-2)
-#define DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE    ((DPI_AWARENESS_CONTEXT)-3)
-#define DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 ((DPI_AWARENESS_CONTEXT)-4)
-
-typedef DPI_AWARENESS_CONTEXT(WINAPI GetThreadDpiAwarenessContextFunc)(void);
-typedef DPI_AWARENESS_CONTEXT(WINAPI SetThreadDpiAwarenessContextFunc)(DPI_AWARENESS_CONTEXT);
-typedef BOOL(AreDpiAwarenessContextsEqualFunc)(DPI_AWARENESS_CONTEXT, DPI_AWARENESS_CONTEXT);
+*/
 typedef BOOL(EnableNonClientDpiScalingFunc)(HWND);
-#endif
+//#endif
 
 // val >= 0 todo [tav] until switch to VS'12
+#if (_MSC_VER < 1700)
 #define round(val) floor(val + 0.5)
+#endif
 
 class AwtObject;
 typedef AwtObject* PDATA;
@@ -89,28 +85,10 @@ typedef AwtObject* PDATA;
     }                                                                     \
 }
 
-#define JNI_CHECK_PEER_GOTO(peer, where) {                                \
-    JNI_CHECK_NULL_GOTO(peer, "peer", where);                             \
-    pData = JNI_GET_PDATA(peer);                                          \
-    if (pData == NULL) {                                                  \
-        THROW_NULL_PDATA_IF_NOT_DESTROYED(peer);                          \
-        goto where;                                                       \
-    }                                                                     \
-}
-
 #define JNI_CHECK_NULL_RETURN(obj, msg) {                                 \
     if (obj == NULL) {                                                    \
         env->ExceptionClear();                                            \
         JNU_ThrowNullPointerException(env, msg);                          \
-        return;                                                           \
-    }                                                                     \
-}
-
-#define JNI_CHECK_PEER_RETURN(peer) {                                     \
-    JNI_CHECK_NULL_RETURN(peer, "peer");                                  \
-    pData = JNI_GET_PDATA(peer);                                          \
-    if (pData == NULL) {                                                  \
-        THROW_NULL_PDATA_IF_NOT_DESTROYED(peer);                          \
         return;                                                           \
     }                                                                     \
 }
@@ -141,6 +119,33 @@ typedef AwtObject* PDATA;
     }                                                                     \
 }
 
+/**
+ * This macros must be used under SyncCall or on the Toolkit thread.
+ */
+#define JNI_CHECK_PEER_GOTO(peer, where) {                                \
+    JNI_CHECK_NULL_GOTO(peer, "peer", where);                             \
+    pData = JNI_GET_PDATA(peer);                                          \
+    if (pData == NULL) {                                                  \
+        THROW_NULL_PDATA_IF_NOT_DESTROYED(peer);                          \
+        goto where;                                                       \
+    }                                                                     \
+}
+
+/**
+ * This macros must be used under SyncCall or on the Toolkit thread.
+ */
+#define JNI_CHECK_PEER_RETURN(peer) {                                     \
+    JNI_CHECK_NULL_RETURN(peer, "peer");                                  \
+    pData = JNI_GET_PDATA(peer);                                          \
+    if (pData == NULL) {                                                  \
+        THROW_NULL_PDATA_IF_NOT_DESTROYED(peer);                          \
+        return;                                                           \
+    }                                                                     \
+}
+
+/**
+ * This macros must be used under SyncCall or on the Toolkit thread.
+ */
 #define JNI_CHECK_PEER_RETURN_NULL(peer) {                                \
     JNI_CHECK_NULL_RETURN_NULL(peer, "peer");                             \
     pData = JNI_GET_PDATA(peer);                                          \
@@ -150,6 +155,9 @@ typedef AwtObject* PDATA;
     }                                                                     \
 }
 
+/**
+ * This macros must be used under SyncCall or on the Toolkit thread.
+ */
 #define JNI_CHECK_PEER_RETURN_VAL(peer, val) {                            \
     JNI_CHECK_NULL_RETURN_VAL(peer, "peer", val);                         \
     pData = JNI_GET_PDATA(peer);                                          \
@@ -195,6 +203,9 @@ typedef AwtObject* PDATA;
 #define IS_WIN2000 (LOBYTE(LOWORD(::GetVersion())) >= 5)
 #define IS_WINXP ((IS_WIN2000 && HIBYTE(LOWORD(::GetVersion())) >= 1) || LOBYTE(LOWORD(::GetVersion())) > 5)
 #define IS_WINVISTA (LOBYTE(LOWORD(::GetVersion())) >= 6)
+#define IS_WIN8 (                                                              \
+    (IS_WINVISTA && (HIBYTE(LOWORD(::GetVersion())) >= 2)) ||                  \
+    (LOBYTE(LOWORD(::GetVersion())) > 6))
 
 #define IS_WINVER_ATLEAST(maj, min) \
                    ((maj) < LOBYTE(LOWORD(::GetVersion())) || \
@@ -208,7 +219,7 @@ typedef AwtObject* PDATA;
 #define LO_INT(l)           ((int)(short)(l))
 #define HI_INT(l)           ((int)(short)(((DWORD)(l) >> 16) & 0xFFFF))
 
-extern JavaVM *jvm;
+extern "C" JavaVM *jvm;
 
 // Platform encoding is Unicode (UTF-16), re-define JNU_ functions
 // to proper JNI functions.

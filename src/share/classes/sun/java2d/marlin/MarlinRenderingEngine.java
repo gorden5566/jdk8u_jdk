@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2007, 2016, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2007, 2018, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -31,6 +31,7 @@ import java.awt.geom.AffineTransform;
 import java.awt.geom.Path2D;
 import java.awt.geom.PathIterator;
 import java.security.AccessController;
+import java.util.Arrays;
 import static sun.java2d.marlin.MarlinUtils.logInfo;
 import sun.awt.geom.PathConsumer2D;
 import sun.java2d.ReentrantContextProvider;
@@ -44,15 +45,55 @@ import sun.security.action.GetPropertyAction;
 /**
  * Marlin RendererEngine implementation (derived from Pisces)
  */
-public class MarlinRenderingEngine extends RenderingEngine
-                                   implements MarlinConst
+public final class MarlinRenderingEngine extends RenderingEngine
+                                         implements MarlinConst
 {
-    private static enum NormMode {ON_WITH_AA, ON_NO_AA, OFF}
+    // slightly slower ~2% if enabled stroker clipping (lines) but skipping cap / join handling is few percents faster in specific cases
+    static final boolean DISABLE_2ND_STROKER_CLIPPING = true;
 
-    private static final float MIN_PEN_SIZE = 1f / NORM_SUBPIXELS;
+    static final boolean DO_TRACE_PATH = false;
+
+    static final boolean DO_CLIP = MarlinProperties.isDoClip();
+    static final boolean DO_CLIP_FILL = true;
+    static final boolean DO_CLIP_RUNTIME_ENABLE = MarlinProperties.isDoClipRuntimeFlag();
+
+    private static final float MIN_PEN_SIZE = 1.0f / MIN_SUBPIXELS;
 
     static final float UPPER_BND = Float.MAX_VALUE / 2.0f;
     static final float LOWER_BND = -UPPER_BND;
+
+    private enum NormMode {
+        ON_WITH_AA {
+            @Override
+            PathIterator getNormalizingPathIterator(final RendererContext rdrCtx,
+                                                    final PathIterator src)
+            {
+                // NormalizingPathIterator NearestPixelCenter:
+                return rdrCtx.nPCPathIterator.init(src);
+            }
+        },
+        ON_NO_AA{
+            @Override
+            PathIterator getNormalizingPathIterator(final RendererContext rdrCtx,
+                                                    final PathIterator src)
+            {
+                // NearestPixel NormalizingPathIterator:
+                return rdrCtx.nPQPathIterator.init(src);
+            }
+        },
+        OFF{
+            @Override
+            PathIterator getNormalizingPathIterator(final RendererContext rdrCtx,
+                                                    final PathIterator src)
+            {
+                // return original path iterator if normalization is disabled:
+                return src;
+            }
+        };
+
+        abstract PathIterator getNormalizingPathIterator(RendererContext rdrCtx,
+                                                         PathIterator src);
+    }
 
     /**
      * Public constructor
@@ -91,13 +132,7 @@ public class MarlinRenderingEngine extends RenderingEngine
         final RendererContext rdrCtx = getRendererContext();
         try {
             // initialize a large copyable Path2D to avoid a lot of array growing:
-            final Path2D.Float p2d =
-                    (rdrCtx.p2d == null) ?
-                    (rdrCtx.p2d = new Path2D.Float(Path2D.WIND_NON_ZERO,
-                                                   INITIAL_MEDIUM_ARRAY))
-                    : rdrCtx.p2d;
-            // reset
-            p2d.reset();
+            final Path2D.Float p2d = rdrCtx.getPath2D();
 
             strokeTo(rdrCtx,
                      src,
@@ -109,7 +144,7 @@ public class MarlinRenderingEngine extends RenderingEngine
                      miterlimit,
                      dashes,
                      dashphase,
-                     rdrCtx.transformerPC2D.wrapPath2d(p2d)
+                     rdrCtx.transformerPC2D.wrapPath2D(p2d)
                     );
 
             // Use Path2D copy constructor (trim)
@@ -128,11 +163,11 @@ public class MarlinRenderingEngine extends RenderingEngine
      * The specified {@code src} {@link Shape} is widened according
      * to the parameters specified by the {@link BasicStroke} object.
      * Adjustments are made to the path as appropriate for the
-     * {@link VALUE_STROKE_NORMALIZE} hint if the {@code normalize}
-     * boolean parameter is true.
+     * {@link java.awt.RenderingHints#VALUE_STROKE_NORMALIZE} hint if the
+     * {@code normalize} boolean parameter is true.
      * Adjustments are made to the path as appropriate for the
-     * {@link VALUE_ANTIALIAS_ON} hint if the {@code antialias}
-     * boolean parameter is true.
+     * {@link java.awt.RenderingHints#VALUE_ANTIALIAS_ON} hint if the
+     * {@code antialias} boolean parameter is true.
      * <p>
      * The geometry of the widened path is forwarded to the indicated
      * {@link PathConsumer2D} object as it is calculated.
@@ -170,14 +205,14 @@ public class MarlinRenderingEngine extends RenderingEngine
         }
     }
 
-    final void strokeTo(final RendererContext rdrCtx,
-                        Shape src,
-                        AffineTransform at,
-                        BasicStroke bs,
-                        boolean thin,
-                        NormMode normalize,
-                        boolean antialias,
-                        PathConsumer2D pc2d)
+    void strokeTo(final RendererContext rdrCtx,
+                  Shape src,
+                  AffineTransform at,
+                  BasicStroke bs,
+                  boolean thin,
+                  NormMode normalize,
+                  boolean antialias,
+                  PathConsumer2D pc2d)
     {
         float lw;
         if (thin) {
@@ -202,7 +237,7 @@ public class MarlinRenderingEngine extends RenderingEngine
                  pc2d);
     }
 
-    private final float userSpaceLineWidth(AffineTransform at, float lw) {
+    private float userSpaceLineWidth(AffineTransform at, float lw) {
 
         float widthScale;
 
@@ -234,7 +269,7 @@ public class MarlinRenderingEngine extends RenderingEngine
              */
 
             double EA = A*A + B*B;          // x^2 coefficient
-            double EB = 2.0*(A*C + B*D);    // xy coefficient
+            double EB = 2.0d * (A*C + B*D); // xy coefficient
             double EC = C*C + D*D;          // y^2 coefficient
 
             /*
@@ -262,7 +297,7 @@ public class MarlinRenderingEngine extends RenderingEngine
 
             double hypot = Math.sqrt(EB*EB + (EA-EC)*(EA-EC));
             // sqrt omitted, compare to squared limits below.
-            double widthsquared = ((EA + EC + hypot)/2.0);
+            double widthsquared = ((EA + EC + hypot) / 2.0d);
 
             widthScale = (float)Math.sqrt(widthsquared);
         }
@@ -270,17 +305,17 @@ public class MarlinRenderingEngine extends RenderingEngine
         return (lw / widthScale);
     }
 
-    final void strokeTo(final RendererContext rdrCtx,
-                        Shape src,
-                        AffineTransform at,
-                        float width,
-                        NormMode normalize,
-                        int caps,
-                        int join,
-                        float miterlimit,
-                        float[] dashes,
-                        float dashphase,
-                        PathConsumer2D pc2d)
+    void strokeTo(final RendererContext rdrCtx,
+                  Shape src,
+                  AffineTransform at,
+                  float width,
+                  NormMode norm,
+                  int caps,
+                  int join,
+                  float miterlimit,
+                  float[] dashes,
+                  float dashphase,
+                  PathConsumer2D pc2d)
     {
         // We use strokerat so that in Stroker and Dasher we can work only
         // with the pre-transformation coordinates. This will repeat a lot of
@@ -307,7 +342,7 @@ public class MarlinRenderingEngine extends RenderingEngine
             final double d = at.getScaleY();
             final double det = a * d - c * b;
 
-            if (Math.abs(det) <= (2f * Float.MIN_VALUE)) {
+            if (Math.abs(det) <= (2.0f * Float.MIN_VALUE)) {
                 // this rendering engine takes one dimensional curves and turns
                 // them into 2D shapes by giving them width.
                 // However, if everything is to be passed through a singular
@@ -319,7 +354,7 @@ public class MarlinRenderingEngine extends RenderingEngine
                 // of writing of this comment (September 16, 2010)). Actually,
                 // I am not sure if the moveTo is necessary to avoid the SIGSEGV
                 // but the pathDone is definitely needed.
-                pc2d.moveTo(0f, 0f);
+                pc2d.moveTo(0.0f, 0.0f);
                 pc2d.pathDone();
                 return;
             }
@@ -336,18 +371,7 @@ public class MarlinRenderingEngine extends RenderingEngine
                 if (dashes != null) {
                     recycleDashes = true;
                     dashLen = dashes.length;
-                    final float[] newDashes;
-                    if (dashLen <= INITIAL_ARRAY) {
-                        newDashes = rdrCtx.dasher.dashes_initial;
-                    } else {
-                        if (DO_STATS) {
-                            rdrCtx.stats.stat_array_dasher_dasher
-                                .add(dashLen);
-                        }
-                        newDashes = rdrCtx.getDirtyFloatArray(dashLen);
-                    }
-                    System.arraycopy(dashes, 0, newDashes, 0, dashLen);
-                    dashes = newDashes;
+                    dashes = rdrCtx.dasher.copyDashArray(dashes);
                     for (int i = 0; i < dashLen; i++) {
                         dashes[i] *= scale;
                     }
@@ -380,28 +404,62 @@ public class MarlinRenderingEngine extends RenderingEngine
             at = null;
         }
 
+        final TransformingPathConsumer2D transformerPC2D = rdrCtx.transformerPC2D;
+
+        if (DO_TRACE_PATH) {
+            // trace Stroker:
+            pc2d = transformerPC2D.traceStroker(pc2d);
+        }
+
         if (USE_SIMPLIFIER) {
             // Use simplifier after stroker before Renderer
             // to remove collinear segments (notably due to cap square)
             pc2d = rdrCtx.simplifier.init(pc2d);
         }
 
-        final TransformingPathConsumer2D transformerPC2D = rdrCtx.transformerPC2D;
+        // deltaTransformConsumer may adjust the clip rectangle:
         pc2d = transformerPC2D.deltaTransformConsumer(pc2d, strokerat);
 
-        pc2d = rdrCtx.stroker.init(pc2d, width, caps, join, miterlimit);
+        // stroker will adjust the clip rectangle (width / miter limit):
+        pc2d = rdrCtx.stroker.init(pc2d, width, caps, join, miterlimit,
+                (dashes == null));
+
+        // Curve Monotizer:
+        rdrCtx.monotonizer.init(width);
 
         if (dashes != null) {
             if (!recycleDashes) {
                 dashLen = dashes.length;
             }
+            if (DO_TRACE_PATH) {
+                pc2d = transformerPC2D.traceDasher(pc2d);
+            }
             pc2d = rdrCtx.dasher.init(pc2d, dashes, dashLen, dashphase,
                                       recycleDashes);
+
+            if (DISABLE_2ND_STROKER_CLIPPING) {
+                // disable stoker clipping
+                rdrCtx.stroker.disableClipping();
+            }
+
+        } else if (rdrCtx.doClip && (caps != Stroker.CAP_BUTT)) {
+            if (DO_TRACE_PATH) {
+                pc2d = transformerPC2D.traceClosedPathDetector(pc2d);
+            }
+
+            // If no dash and clip is enabled:
+            // detect closedPaths (polygons) for caps
+            pc2d = transformerPC2D.detectClosedPath(pc2d);
         }
         pc2d = transformerPC2D.inverseDeltaTransformConsumer(pc2d, strokerat);
 
-        final PathIterator pi = getNormalizingPathIterator(rdrCtx, normalize,
-                                    src.getPathIterator(at));
+        if (DO_TRACE_PATH) {
+            // trace Input:
+            pc2d = transformerPC2D.traceInput(pc2d);
+        }
+
+        final PathIterator pi = norm.getNormalizingPathIterator(rdrCtx,
+                                         src.getPathIterator(at));
 
         pathTo(rdrCtx, pi, pc2d);
 
@@ -421,26 +479,7 @@ public class MarlinRenderingEngine extends RenderingEngine
     }
 
     private static boolean nearZero(final double num) {
-        return Math.abs(num) < 2.0 * Math.ulp(num);
-    }
-
-    PathIterator getNormalizingPathIterator(final RendererContext rdrCtx,
-                                            final NormMode mode,
-                                            final PathIterator src)
-    {
-        switch (mode) {
-            case ON_WITH_AA:
-                // NormalizingPathIterator NearestPixelCenter:
-                return rdrCtx.nPCPathIterator.init(src);
-            case ON_NO_AA:
-                // NearestPixel NormalizingPathIterator:
-                return rdrCtx.nPQPathIterator.init(src);
-            case OFF:
-                // return original path iterator if normalization is disabled:
-                return src;
-            default:
-                throw new InternalError("Unrecognized normalization mode");
-        }
+        return Math.abs(num) < 2.0d * Math.ulp(num);
     }
 
     abstract static class NormalizingPathIterator implements PathIterator {
@@ -519,8 +558,8 @@ public class MarlinRenderingEngine extends RenderingEngine
                 case PathIterator.SEG_LINETO:
                     break;
                 case PathIterator.SEG_QUADTO:
-                    coords[0] += (curx_adjust + x_adjust) / 2f;
-                    coords[1] += (cury_adjust + y_adjust) / 2f;
+                    coords[0] += (curx_adjust + x_adjust) / 2.0f;
+                    coords[1] += (cury_adjust + y_adjust) / 2.0f;
                     break;
                 case PathIterator.SEG_CUBICTO:
                     coords[0] += curx_adjust;
@@ -599,14 +638,18 @@ public class MarlinRenderingEngine extends RenderingEngine
     }
 
     private static void pathTo(final RendererContext rdrCtx, final PathIterator pi,
-                               final PathConsumer2D pc2d)
+                               PathConsumer2D pc2d)
     {
+        if (USE_PATH_SIMPLIFIER) {
+            // Use path simplifier at the first step
+            // to remove useless points
+            pc2d = rdrCtx.pathSimplifier.init(pc2d);
+        }
+
         // mark context as DIRTY:
         rdrCtx.dirty = true;
 
-        final float[] coords = rdrCtx.float6;
-
-        pathToLoop(coords, pi, pc2d);
+        pathToLoop(rdrCtx.float6, pi, pc2d);
 
         // mark context as CLEAN:
         rdrCtx.dirty = false;
@@ -784,6 +827,35 @@ public class MarlinRenderingEngine extends RenderingEngine
 
         final RendererContext rdrCtx = getRendererContext();
         try {
+            if (DO_CLIP || (DO_CLIP_RUNTIME_ENABLE && MarlinProperties.isDoClipAtRuntime())) {
+                // Define the initial clip bounds:
+                final float[] clipRect = rdrCtx.clipRect;
+
+                // Adjust the clipping rectangle with the renderer offsets
+                final float rdrOffX = Renderer.RDR_OFFSET_X;
+                final float rdrOffY = Renderer.RDR_OFFSET_Y;
+
+                // add a small rounding error:
+                final float margin = 1e-3f;
+
+                clipRect[0] = clip.getLoY()
+                                - margin + rdrOffY;
+                clipRect[1] = clip.getLoY() + clip.getHeight()
+                                + margin + rdrOffY;
+                clipRect[2] = clip.getLoX()
+                                - margin + rdrOffX;
+                clipRect[3] = clip.getLoX() + clip.getWidth()
+                                + margin + rdrOffX;
+
+                if (MarlinConst.DO_LOG_CLIP) {
+                    MarlinUtils.logInfo("clipRect (clip): "
+                                        + Arrays.toString(rdrCtx.clipRect));
+                }
+
+                // Enable clipping:
+                rdrCtx.doClip = true;
+            }
+
             // Test if at is identity:
             final AffineTransform _at = (at != null && !at.isIdentity()) ? at
                                         : null;
@@ -792,21 +864,35 @@ public class MarlinRenderingEngine extends RenderingEngine
 
             if (bs == null) {
                 // fill shape:
-                final PathIterator pi = getNormalizingPathIterator(rdrCtx, norm,
-                                            s.getPathIterator(_at));
+                final PathIterator pi = norm.getNormalizingPathIterator(rdrCtx,
+                                                 s.getPathIterator(_at));
 
                 // note: Winding rule may be EvenOdd ONLY for fill operations !
                 r = rdrCtx.renderer.init(clip.getLoX(), clip.getLoY(),
                                          clip.getWidth(), clip.getHeight(),
                                          pi.getWindingRule());
 
-                // TODO: subdivide quad/cubic curves into monotonic curves ?
-                pathTo(rdrCtx, pi, r);
+                PathConsumer2D pc2d = r;
+
+                if (DO_CLIP_FILL && rdrCtx.doClip) {
+                    if (DO_TRACE_PATH) {
+                        // trace Filler:
+                        pc2d = rdrCtx.transformerPC2D.traceFiller(pc2d);
+                    }
+                    pc2d = rdrCtx.transformerPC2D.pathClipper(pc2d);
+                }
+
+                if (DO_TRACE_PATH) {
+                    // trace Input:
+                    pc2d = rdrCtx.transformerPC2D.traceInput(pc2d);
+                }
+                pathTo(rdrCtx, pi, pc2d);
+
             } else {
                 // draw shape with given stroke:
                 r = rdrCtx.renderer.init(clip.getLoX(), clip.getLoY(),
                                          clip.getWidth(), clip.getHeight(),
-                                         PathIterator.WIND_NON_ZERO);
+                                         WIND_NON_ZERO);
 
                 strokeTo(rdrCtx, s, _at, bs, thin, norm, true, r);
             }
@@ -819,10 +905,8 @@ public class MarlinRenderingEngine extends RenderingEngine
             }
         } finally {
             if (r != null) {
-                // dispose renderer:
+                // dispose renderer and recycle the RendererContext instance:
                 r.dispose();
-                // recycle the RendererContext instance
-                MarlinRenderingEngine.returnRendererContext(rdrCtx);
             }
         }
 
@@ -831,34 +915,34 @@ public class MarlinRenderingEngine extends RenderingEngine
     }
 
     @Override
-    public final AATileGenerator getAATileGenerator(double x, double y,
-                                                    double dx1, double dy1,
-                                                    double dx2, double dy2,
-                                                    double lw1, double lw2,
-                                                    Region clip,
-                                                    int[] bbox)
+    public AATileGenerator getAATileGenerator(double x, double y,
+                                              double dx1, double dy1,
+                                              double dx2, double dy2,
+                                              double lw1, double lw2,
+                                              Region clip,
+                                              int[] bbox)
     {
         // REMIND: Deal with large coordinates!
         double ldx1, ldy1, ldx2, ldy2;
-        boolean innerpgram = (lw1 > 0.0 && lw2 > 0.0);
+        boolean innerpgram = (lw1 > 0.0d && lw2 > 0.0d);
 
         if (innerpgram) {
             ldx1 = dx1 * lw1;
             ldy1 = dy1 * lw1;
             ldx2 = dx2 * lw2;
             ldy2 = dy2 * lw2;
-            x -= (ldx1 + ldx2) / 2.0;
-            y -= (ldy1 + ldy2) / 2.0;
+            x -= (ldx1 + ldx2) / 2.0d;
+            y -= (ldy1 + ldy2) / 2.0d;
             dx1 += ldx1;
             dy1 += ldy1;
             dx2 += ldx2;
             dy2 += ldy2;
-            if (lw1 > 1.0 && lw2 > 1.0) {
+            if (lw1 > 1.0d && lw2 > 1.0d) {
                 // Inner parallelogram was entirely consumed by stroke...
                 innerpgram = false;
             }
         } else {
-            ldx1 = ldy1 = ldx2 = ldy2 = 0.0;
+            ldx1 = ldy1 = ldx2 = ldy2 = 0.0d;
         }
 
         MarlinTileGenerator ptg = null;
@@ -867,8 +951,8 @@ public class MarlinRenderingEngine extends RenderingEngine
         final RendererContext rdrCtx = getRendererContext();
         try {
             r = rdrCtx.renderer.init(clip.getLoX(), clip.getLoY(),
-                                         clip.getWidth(), clip.getHeight(),
-                                         Renderer.WIND_EVEN_ODD);
+                                     clip.getWidth(), clip.getHeight(),
+                                     WIND_EVEN_ODD);
 
             r.moveTo((float) x, (float) y);
             r.lineTo((float) (x+dx1), (float) (y+dy1));
@@ -879,10 +963,10 @@ public class MarlinRenderingEngine extends RenderingEngine
             if (innerpgram) {
                 x += ldx1 + ldx2;
                 y += ldy1 + ldy2;
-                dx1 -= 2.0 * ldx1;
-                dy1 -= 2.0 * ldy1;
-                dx2 -= 2.0 * ldx2;
-                dy2 -= 2.0 * ldy2;
+                dx1 -= 2.0d * ldx1;
+                dy1 -= 2.0d * ldy1;
+                dx2 -= 2.0d * ldx2;
+                dy2 -= 2.0d * ldy2;
                 r.moveTo((float) x, (float) y);
                 r.lineTo((float) (x+dx1), (float) (y+dy1));
                 r.lineTo((float) (x+dx1+dx2), (float) (y+dy1+dy2));
@@ -900,10 +984,8 @@ public class MarlinRenderingEngine extends RenderingEngine
             }
         } finally {
             if (r != null) {
-                // dispose renderer:
+                // dispose renderer and recycle the RendererContext instance:
                 r.dispose();
-                // recycle the RendererContext instance
-                MarlinRenderingEngine.returnRendererContext(rdrCtx);
             }
         }
 
@@ -922,14 +1004,14 @@ public class MarlinRenderingEngine extends RenderingEngine
     }
 
     static {
-        if (PathIterator.WIND_NON_ZERO != Renderer.WIND_NON_ZERO ||
-            PathIterator.WIND_EVEN_ODD != Renderer.WIND_EVEN_ODD ||
-            BasicStroke.JOIN_MITER != Stroker.JOIN_MITER ||
-            BasicStroke.JOIN_ROUND != Stroker.JOIN_ROUND ||
-            BasicStroke.JOIN_BEVEL != Stroker.JOIN_BEVEL ||
-            BasicStroke.CAP_BUTT != Stroker.CAP_BUTT ||
-            BasicStroke.CAP_ROUND != Stroker.CAP_ROUND ||
-            BasicStroke.CAP_SQUARE != Stroker.CAP_SQUARE)
+        if (PathIterator.WIND_NON_ZERO != WIND_NON_ZERO ||
+            PathIterator.WIND_EVEN_ODD != WIND_EVEN_ODD ||
+            BasicStroke.JOIN_MITER != JOIN_MITER ||
+            BasicStroke.JOIN_ROUND != JOIN_ROUND ||
+            BasicStroke.JOIN_BEVEL != JOIN_BEVEL ||
+            BasicStroke.CAP_BUTT != CAP_BUTT ||
+            BasicStroke.CAP_ROUND != CAP_ROUND ||
+            BasicStroke.CAP_SQUARE != CAP_SQUARE)
         {
             throw new InternalError("mismatched renderer constants");
         }
@@ -1021,18 +1103,26 @@ public class MarlinRenderingEngine extends RenderingEngine
         logInfo("sun.java2d.renderer.useRef           = "
                 + refType);
 
-        logInfo("sun.java2d.renderer.pixelsize        = "
-                + MarlinConst.INITIAL_PIXEL_DIM);
+        logInfo("sun.java2d.renderer.edges            = "
+                + MarlinConst.INITIAL_EDGES_COUNT);
+        logInfo("sun.java2d.renderer.pixelWidth       = "
+                + MarlinConst.INITIAL_PIXEL_WIDTH);
+        logInfo("sun.java2d.renderer.pixelHeight      = "
+                + MarlinConst.INITIAL_PIXEL_HEIGHT);
+
+        logInfo("sun.java2d.renderer.profile          = "
+                + (MarlinProperties.isProfileQuality() ?
+                    "quality" : "speed"));
+
         logInfo("sun.java2d.renderer.subPixel_log2_X  = "
                 + MarlinConst.SUBPIXEL_LG_POSITIONS_X);
         logInfo("sun.java2d.renderer.subPixel_log2_Y  = "
                 + MarlinConst.SUBPIXEL_LG_POSITIONS_Y);
+
         logInfo("sun.java2d.renderer.tileSize_log2    = "
-                + MarlinConst.TILE_SIZE_LG);
-
-        logInfo("sun.java2d.renderer.blockSize_log2   = "
-                + MarlinConst.BLOCK_SIZE_LG);
-
+                + MarlinConst.TILE_H_LG);
+        logInfo("sun.java2d.renderer.tileWidth_log2   = "
+                + MarlinConst.TILE_W_LG);
         logInfo("sun.java2d.renderer.blockSize_log2   = "
                 + MarlinConst.BLOCK_SIZE_LG);
 
@@ -1052,6 +1142,20 @@ public class MarlinRenderingEngine extends RenderingEngine
         // optimisation parameters
         logInfo("sun.java2d.renderer.useSimplifier    = "
                 + MarlinConst.USE_SIMPLIFIER);
+        logInfo("sun.java2d.renderer.usePathSimplifier= "
+                + MarlinConst.USE_PATH_SIMPLIFIER);
+        logInfo("sun.java2d.renderer.pathSimplifier.pixTol = "
+                + MarlinProperties.getPathSimplifierPixelTolerance());
+
+        logInfo("sun.java2d.renderer.clip             = "
+                + MarlinProperties.isDoClip());
+        logInfo("sun.java2d.renderer.clip.runtime.enable = "
+                + MarlinProperties.isDoClipRuntimeFlag());
+
+        logInfo("sun.java2d.renderer.clip.subdivider  = "
+                + MarlinProperties.isDoClipSubdivider());
+        logInfo("sun.java2d.renderer.clip.subdivider.minLength = "
+                + MarlinProperties.getSubdividerMinLength());
 
         // debugging parameters
         logInfo("sun.java2d.renderer.doStats          = "
@@ -1070,11 +1174,24 @@ public class MarlinRenderingEngine extends RenderingEngine
                 + MarlinConst.LOG_UNSAFE_MALLOC);
 
         // quality settings
+        logInfo("sun.java2d.renderer.curve_len_err    = "
+                + MarlinProperties.getCurveLengthError());
+        logInfo("sun.java2d.renderer.cubic_dec_d2     = "
+                + MarlinProperties.getCubicDecD2());
+        logInfo("sun.java2d.renderer.cubic_inc_d1     = "
+                + MarlinProperties.getCubicIncD1());
+        logInfo("sun.java2d.renderer.quad_dec_d2      = "
+                + MarlinProperties.getQuadDecD2());
+
         logInfo("Renderer settings:");
-        logInfo("CUB_COUNT_LG = " + Renderer.CUB_COUNT_LG);
         logInfo("CUB_DEC_BND  = " + Renderer.CUB_DEC_BND);
         logInfo("CUB_INC_BND  = " + Renderer.CUB_INC_BND);
         logInfo("QUAD_DEC_BND = " + Renderer.QUAD_DEC_BND);
+
+        logInfo("INITIAL_EDGES_CAPACITY               = "
+                + MarlinConst.INITIAL_EDGES_CAPACITY);
+        logInfo("INITIAL_CROSSING_COUNT               = "
+                + Renderer.INITIAL_CROSSING_COUNT);
 
         logInfo("=========================================================="
                 + "=====================");

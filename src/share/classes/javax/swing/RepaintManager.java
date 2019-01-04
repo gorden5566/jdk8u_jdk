@@ -27,7 +27,10 @@ package javax.swing;
 
 import java.awt.*;
 import java.awt.event.*;
+import java.awt.geom.Point2D;
+import java.awt.geom.Rectangle2D;
 import java.awt.image.VolatileImage;
+import java.awt.peer.WindowPeer;
 import java.security.AccessControlContext;
 import java.security.AccessController;
 import java.security.PrivilegedAction;
@@ -108,6 +111,8 @@ public class RepaintManager
     boolean   doubleBufferingEnabled = true;
 
     private Dimension doubleBufferMaxSize;
+
+    private boolean isCustomMaxBufferSizeSet = false;
 
     // Support for both the standard and volatile offscreen buffers exists to
     // provide backwards compatibility for the [rare] programs which may be
@@ -334,7 +339,13 @@ public class RepaintManager
     }
 
     private void displayChanged() {
-        clearImages();
+        if (isCustomMaxBufferSizeSet) {
+            clearImages();
+        } else {
+            // Reset buffer maximum size to get valid size from updated graphics
+            // environment in getDoubleBufferMaximumSize()
+            setDoubleBufferMaximumSize(null);
+        }
     }
 
     /**
@@ -831,24 +842,27 @@ public class RepaintManager
                                                            localBoundsW,
                                                            localBoundsH,
                                                            rect);
-                        if (dirtyComponent instanceof JComponent) {
-                            ((JComponent)dirtyComponent).paintImmediately(
-                                rect.x,rect.y,rect.width, rect.height);
-                        }
-                        else if (dirtyComponent.isShowing()) {
-                            Graphics g = JComponent.safelyGetGraphics(
-                                    dirtyComponent, dirtyComponent);
-                            // If the Graphics goes away, it means someone disposed of
-                            // the window, don't do anything.
-                            if (g != null) {
-                                g.setClip(rect.x, rect.y, rect.width, rect.height);
-                                try {
-                                    dirtyComponent.paint(g);
-                                } finally {
-                                    g.dispose();
+
+                        if (!rect.isEmpty()) {
+                            if (dirtyComponent instanceof JComponent) {
+                                ((JComponent) dirtyComponent).paintImmediately(
+                                        rect.x, rect.y, rect.width, rect.height);
+                            } else if (dirtyComponent.isShowing()) {
+                                Graphics g = JComponent.safelyGetGraphics(
+                                        dirtyComponent, dirtyComponent);
+                                // If the Graphics goes away, it means someone disposed of
+                                // the window, don't do anything.
+                                if (g != null) {
+                                    g.setClip(rect.x, rect.y, rect.width, rect.height);
+                                    try {
+                                        dirtyComponent.paint(g);
+                                    } finally {
+                                        g.dispose();
+                                    }
                                 }
                             }
                         }
+
                         // If the repaintRoot has been set, service it now and
                         // remove any components that are children of repaintRoot.
                         if (repaintRoot != null) {
@@ -1119,8 +1133,10 @@ public class RepaintManager
     public void setDoubleBufferMaximumSize(Dimension d) {
         doubleBufferMaxSize = d;
         if (doubleBufferMaxSize == null) {
+            isCustomMaxBufferSizeSet = false;
             clearImages();
         } else {
+            isCustomMaxBufferSizeSet = true;
             clearImages(d.width, d.height);
         }
     }
@@ -1564,7 +1580,8 @@ public class RepaintManager
          */
         protected void paintDoubleBuffered(JComponent c, Image image,
                 Graphics g, int clipX, int clipY,
-                int clipW, int clipH) {
+                int clipW, int clipH)
+        {
             if (image instanceof VolatileImage && isPixelsCopying(c, g)) {
                 paintDoubleBufferedFPScales(c, image, g, clipX, clipY, clipW, clipH);
             } else {

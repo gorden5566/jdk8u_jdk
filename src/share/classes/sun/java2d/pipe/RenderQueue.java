@@ -72,7 +72,7 @@ import sun.awt.SunToolkit;
 public abstract class RenderQueue {
 
     /** The size of the underlying buffer, in bytes. */
-    private static final int BUFFER_SIZE = 32000;
+    private static final int BUFFER_SIZE = 6400000;
 
     /** The underlying buffer for this queue. */
     protected RenderBuffer buf;
@@ -201,18 +201,7 @@ public abstract class RenderQueue {
      * This method will block until the entire buffer has been flushed.  The
      * queue lock must be acquired before calling this method.
      */
-    public void flushNow() {
-        flushNow(true);
-    }
-
-    /**
-     * Schedule to process each operation currently pending on the buffer.
-     * This method will block until the entire buffer has been flushed.  The
-     * queue lock must be acquired before calling this method.
-     * @param sync true, process the operations immediately
-     */
-    public abstract void flushNow(boolean sync);
-
+    public abstract void flushNow();
 
     /**
      * Immediately processes each operation currently pending on the buffer,
@@ -232,3 +221,4 @@ public abstract class RenderQueue {
         flushNow();
     }
 }
+

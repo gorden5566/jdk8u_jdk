@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 1996, 2013, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 1996, 2018, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -32,14 +32,19 @@ import java.lang.ref.WeakReference;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.UndeclaredThrowableException;
 import java.lang.reflect.Member;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
 import java.lang.reflect.Proxy;
+import java.security.AccessControlContext;
 import java.security.AccessController;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.security.PermissionCollection;
+import java.security.Permissions;
 import java.security.PrivilegedAction;
+import java.security.ProtectionDomain;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -48,6 +53,8 @@ import java.util.HashSet;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import sun.misc.JavaSecurityAccess;
+import sun.misc.SharedSecrets;
 import sun.misc.Unsafe;
 import sun.reflect.CallerSensitive;
 import sun.reflect.Reflection;
@@ -78,6 +85,18 @@ public class ObjectStreamClass implements Serializable {
     private static final long serialVersionUID = -6120832682080437368L;
     private static final ObjectStreamField[] serialPersistentFields =
         NO_FIELDS;
+
+    /** true if deserialization constructor checking is disabled */
+    private static boolean disableSerialConstructorChecks =
+        AccessController.doPrivileged(
+            new PrivilegedAction<Boolean>() {
+                public Boolean run() {
+                    String prop = "jdk.disableSerialConstructorChecks";
+                    return "true".equals(System.getProperty(prop))
+                            ? Boolean.TRUE : Boolean.FALSE;
+                }
+            }
+        ).booleanValue();
 
     /** reflection factory for obtaining serialization constructors */
     private static final ReflectionFactory reflFactory =
@@ -173,6 +192,9 @@ public class ObjectStreamClass implements Serializable {
 
     /** serialization-appropriate constructor, or null if none */
     private Constructor<?> cons;
+    /** protection domains that need to be checked when calling the constructor */
+    private ProtectionDomain[] domains;
+
     /** class-defined writeObject method, or null if none */
     private Method writeObjectMethod;
     /** class-defined readObject method, or null if none */
@@ -505,6 +527,7 @@ public class ObjectStreamClass implements Serializable {
                             cl, "readObjectNoData", null, Void.TYPE);
                         hasWriteObjectData = (writeObjectMethod != null);
                     }
+                    domains = getProtectionDomains(cons, cl);
                     writeReplaceMethod = getInheritableMethod(
                         cl, "writeReplace", null, Object.class);
                     readResolveMethod = getInheritableMethod(
@@ -548,6 +571,65 @@ public class ObjectStreamClass implements Serializable {
     }
 
     /**
+     * Creates a PermissionDomain that grants no permission.
+     */
+    private ProtectionDomain noPermissionsDomain() {
+        PermissionCollection perms = new Permissions();
+        perms.setReadOnly();
+        return new ProtectionDomain(null, perms);
+    }
+
+    /**
+     * Aggregate the ProtectionDomains of all the classes that separate
+     * a concrete class {@code cl} from its ancestor's class declaring
+     * a constructor {@code cons}.
+     *
+     * If {@code cl} is defined by the boot loader, or the constructor
+     * {@code cons} is declared by {@code cl}, or if there is no security
+     * manager, then this method does nothing and {@code null} is returned.
+     *
+     * @param cons A constructor declared by {@code cl} or one of its
+     *             ancestors.
+     * @param cl A concrete class, which is either the class declaring
+     *           the constructor {@code cons}, or a serializable subclass
+     *           of that class.
+     * @return An array of ProtectionDomain representing the set of
+     *         ProtectionDomain that separate the concrete class {@code cl}
+     *         from its ancestor's declaring {@code cons}, or {@code null}.
+     */
+    private ProtectionDomain[] getProtectionDomains(Constructor<?> cons,
+                                                    Class<?> cl) {
+        ProtectionDomain[] domains = null;
+        if (cons != null && cl.getClassLoader() != null
+                && System.getSecurityManager() != null) {
+            Class<?> cls = cl;
+            Class<?> fnscl = cons.getDeclaringClass();
+            Set<ProtectionDomain> pds = null;
+            while (cls != fnscl) {
+                ProtectionDomain pd = cls.getProtectionDomain();
+                if (pd != null) {
+                    if (pds == null) pds = new HashSet<>();
+                    pds.add(pd);
+                }
+                cls = cls.getSuperclass();
+                if (cls == null) {
+                    // that's not supposed to happen
+                    // make a ProtectionDomain with no permission.
+                    // should we throw instead?
+                    if (pds == null) pds = new HashSet<>();
+                    else pds.clear();
+                    pds.add(noPermissionsDomain());
+                    break;
+                }
+            }
+            if (pds != null) {
+                domains = pds.toArray(new ProtectionDomain[0]);
+            }
+        }
+        return domains;
+    }
+
+    /**
      * Initializes class descriptor representing a proxy class.
      */
     void initProxy(Class<?> cl,
@@ -577,6 +659,7 @@ public class ObjectStreamClass implements Serializable {
             writeReplaceMethod = localDesc.writeReplaceMethod;
             readResolveMethod = localDesc.readResolveMethod;
             deserializeEx = localDesc.deserializeEx;
+            domains = localDesc.domains;
             cons = localDesc.cons;
         }
         fieldRefl = getReflector(fields, localDesc);
@@ -663,6 +746,7 @@ public class ObjectStreamClass implements Serializable {
             if (deserializeEx == null) {
                 deserializeEx = localDesc.deserializeEx;
             }
+            domains = localDesc.domains;
             cons = localDesc.cons;
         }
 
@@ -1003,7 +1087,35 @@ public class ObjectStreamClass implements Serializable {
         requireInitialized();
         if (cons != null) {
             try {
-                return cons.newInstance();
+                if (domains == null || domains.length == 0) {
+                    return cons.newInstance();
+                } else {
+                    JavaSecurityAccess jsa = SharedSecrets.getJavaSecurityAccess();
+                    PrivilegedAction<?> pea = () -> {
+                        try {
+                            return cons.newInstance();
+                        } catch (InstantiationException
+                                 | InvocationTargetException
+                                 | IllegalAccessException x) {
+                            throw new UndeclaredThrowableException(x);
+                        }
+                    }; // Can't use PrivilegedExceptionAction with jsa
+                    try {
+                        return jsa.doIntersectionPrivilege(pea,
+                                   AccessController.getContext(),
+                                   new AccessControlContext(domains));
+                    } catch (UndeclaredThrowableException x) {
+                        Throwable cause = x.getCause();
+                        if (cause instanceof InstantiationException)
+                            throw (InstantiationException) cause;
+                        if (cause instanceof InvocationTargetException)
+                            throw (InvocationTargetException) cause;
+                        if (cause instanceof IllegalAccessException)
+                            throw (IllegalAccessException) cause;
+                        // not supposed to happen
+                        throw x;
+                    }
+                }
             } catch (IllegalAccessException ex) {
                 // should not occur, as access checks have been suppressed
                 throw new InternalError(ex);
@@ -1397,6 +1509,46 @@ public class ObjectStreamClass implements Serializable {
     }
 
     /**
+     * Given a class, determines whether its superclass has
+     * any constructors that are accessible from the class.
+     * This is a special purpose method intended to do access
+     * checking for a serializable class and its superclasses
+     * up to, but not including, the first non-serializable
+     * superclass. This also implies that the superclass is
+     * always non-null, because a serializable class must be a
+     * class (not an interface) and Object is not serializable.
+     *
+     * @param cl the class from which access is checked
+     * @return whether the superclass has a constructor accessible from cl
+     */
+    private static boolean superHasAccessibleConstructor(Class<?> cl) {
+        Class<?> superCl = cl.getSuperclass();
+        assert Serializable.class.isAssignableFrom(cl);
+        assert superCl != null;
+        if (packageEquals(cl, superCl)) {
+            // accessible if any non-private constructor is found
+            for (Constructor<?> ctor : superCl.getDeclaredConstructors()) {
+                if ((ctor.getModifiers() & Modifier.PRIVATE) == 0) {
+                    return true;
+                }
+            }
+            return false;
+        } else {
+            // sanity check to ensure the parent is protected or public
+            if ((superCl.getModifiers() & (Modifier.PROTECTED | Modifier.PUBLIC)) == 0) {
+                return false;
+            }
+            // accessible if any constructor is protected or public
+            for (Constructor<?> ctor : superCl.getDeclaredConstructors()) {
+                if ((ctor.getModifiers() & (Modifier.PROTECTED | Modifier.PUBLIC)) != 0) {
+                    return true;
+                }
+            }
+            return false;
+        }
+    }
+
+    /**
      * Returns subclass-accessible no-arg constructor of first non-serializable
      * superclass, or null if none found.  Access checks are disabled on the
      * returned constructor (if any).
@@ -1404,7 +1556,9 @@ public class ObjectStreamClass implements Serializable {
     private static Constructor<?> getSerializableConstructor(Class<?> cl) {
         Class<?> initCl = cl;
         while (Serializable.class.isAssignableFrom(initCl)) {
-            if ((initCl = initCl.getSuperclass()) == null) {
+            Class<?> prev = initCl;
+            if ((initCl = initCl.getSuperclass()) == null ||
+                (!disableSerialConstructorChecks && !superHasAccessibleConstructor(prev))) {
                 return null;
             }
         }

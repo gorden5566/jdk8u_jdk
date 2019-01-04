@@ -1032,16 +1032,6 @@ abstract class XDecoratedPeer extends XWindowPeer {
         }
     }
 
-    protected void suppressWmTakeFocus(boolean doSuppress) {
-        XAtomList protocols = getWMProtocols();
-        if (doSuppress) {
-            protocols.remove(wm_take_focus);
-        } else {
-            protocols.add(wm_take_focus);
-        }
-        wm_protocols.setAtomListProperty(this, protocols);
-    }
-
     public void dispose() {
         if (content != null) {
             content.destroy();
@@ -1225,7 +1215,7 @@ abstract class XDecoratedPeer extends XWindowPeer {
             if (target == activeWindow && target != focusedWindow) {
                 // Happens when an owned window is currently focused
                 focusLog.fine("Focus is on child window - transferring it back to the owner");
-                handleWindowFocusInSync(-1);
+                handleWindowFocusInSync(-1, () -> {});
                 return true;
             }
             Window realNativeFocusedWindow = XWindowPeer.getNativeFocusedWindow();

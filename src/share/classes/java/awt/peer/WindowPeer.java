@@ -25,6 +25,7 @@
 
 package java.awt.peer;
 
+import javax.swing.*;
 import java.awt.*;
 
 /**
@@ -117,4 +118,28 @@ public interface WindowPeer extends ContainerPeer {
      * Instructs the peer to update the position of the security warning.
      */
     void repositionSecurityWarning();
+
+    /**
+     * Returns the system insets (in the scale of the Window device) when available.
+     *
+     * @return the system insets or null
+     */
+    default Insets getSysInsets() { return null; }
+
+    static boolean isLightweightDialog(Window window) {
+        if (window instanceof RootPaneContainer) {
+            RootPaneContainer rootPaneContainer = (RootPaneContainer) window;
+            JRootPane rootPane = rootPaneContainer.getRootPane();
+            if (rootPane != null) {
+                Object property = rootPane.getClientProperty("SIMPLE_WINDOW");
+                if (property instanceof Boolean) {
+                    Boolean isLightweightDialog = (Boolean)property;
+                    if (isLightweightDialog) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
 }

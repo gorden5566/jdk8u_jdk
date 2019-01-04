@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013, 2015 Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2013, 2017 Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -39,7 +39,7 @@ public final class OutputAnalyzer {
 
     private final String stdout;
     private final String stderr;
-    private final int exitValue;
+    private final int exitValue;    // useless now. output contains exit value.
 
     /**
      * Create an OutputAnalyzer, a utility class for verifying output and exit
@@ -365,11 +365,26 @@ public final class OutputAnalyzer {
     }
 
     /**
+     * Verify the exit value of the process
+     *
+     * @param notExpectedExitValue Unexpected exit value from process
+     * @throws RuntimeException If the exit value from the process did match the expected value
+     */
+    public OutputAnalyzer shouldNotHaveExitValue(int notExpectedExitValue) {
+        if (getExitValue() == notExpectedExitValue) {
+            reportDiagnosticSummary();
+            throw new RuntimeException("Unexpected to get exit value of ["
+                    + notExpectedExitValue + "]\n");
+        }
+        return this;
+    }
+
+    /**
      * Report summary that will help to diagnose the problem Currently includes:
      * - standard input produced by the process under test - standard output -
      * exit code Note: the command line is printed by the ProcessTools
      */
-    private OutputAnalyzer reportDiagnosticSummary() {
+    public OutputAnalyzer reportDiagnosticSummary() {
         String msg = " stdout: [" + stdout + "];\n" + " stderr: [" + stderr
                 + "]\n" + " exitValue = " + getExitValue() + "\n";
 

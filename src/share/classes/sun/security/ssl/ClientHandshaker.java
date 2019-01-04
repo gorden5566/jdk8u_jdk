@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 1996, 2015, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 1996, 2018, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -191,19 +191,24 @@ final class ClientHandshaker extends Handshaker {
      */
     @Override
     void processMessage(byte type, int messageLen) throws IOException {
-        if (state >= type
-                && (type != HandshakeMessage.ht_hello_request)) {
-            throw new SSLProtocolException(
-                    "Handshake message sequence violation, " + type);
-        }
+
+        // check the handshake state
+        List<Byte> ignoredOptStates = handshakeState.check(type);
 
         switch (type) {
         case HandshakeMessage.ht_hello_request:
-            this.serverHelloRequest(new HelloRequest(input));
+            HelloRequest helloRequest = new HelloRequest(input);
+            handshakeState.update(helloRequest, resumingSession);
+            this.serverHelloRequest(helloRequest);
             break;
 
         case HandshakeMessage.ht_server_hello:
-            this.serverHello(new ServerHello(input, messageLen));
+            ServerHello serverHello = new ServerHello(input, messageLen);
+            this.serverHello(serverHello);
+
+            // This handshake state update needs the resumingSession value
+            // set by serverHello().
+            handshakeState.update(serverHello, resumingSession);
             break;
 
         case HandshakeMessage.ht_certificate:
@@ -213,7 +218,9 @@ final class ClientHandshaker extends Handshaker {
                     "unexpected server cert chain");
                 // NOTREACHED
             }
-            this.serverCertificate(new CertificateMsg(input));
+            CertificateMsg certificateMsg = new CertificateMsg(input);
+            handshakeState.update(certificateMsg, resumingSession);
+            this.serverCertificate(certificateMsg);
             serverKey =
                 session.getPeerCertificates()[0].getPublicKey();
             break;
@@ -249,15 +256,20 @@ final class ClientHandshaker extends Handshaker {
                 }
 
                 try {
-                    this.serverKeyExchange(new RSA_ServerKeyExchange(input));
+                    RSA_ServerKeyExchange rsaSrvKeyExchange =
+                                    new RSA_ServerKeyExchange(input);
+                    handshakeState.update(rsaSrvKeyExchange, resumingSession);
+                    this.serverKeyExchange(rsaSrvKeyExchange);
                 } catch (GeneralSecurityException e) {
                     throwSSLException("Server key", e);
                 }
                 break;
             case K_DH_ANON:
                 try {
-                    this.serverKeyExchange(new DH_ServerKeyExchange(
-                                                input, protocolVersion));
+                    DH_ServerKeyExchange dhSrvKeyExchange =
+                            new DH_ServerKeyExchange(input, protocolVersion);
+                    handshakeState.update(dhSrvKeyExchange, resumingSession);
+                    this.serverKeyExchange(dhSrvKeyExchange);
                 } catch (GeneralSecurityException e) {
                     throwSSLException("Server key", e);
                 }
@@ -265,11 +277,14 @@ final class ClientHandshaker extends Handshaker {
             case K_DHE_DSS:
             case K_DHE_RSA:
                 try {
-                    this.serverKeyExchange(new DH_ServerKeyExchange(
+                    DH_ServerKeyExchange dhSrvKeyExchange =
+                        new DH_ServerKeyExchange(
                         input, serverKey,
                         clnt_random.random_bytes, svr_random.random_bytes,
                         messageLen,
-                        getLocalSupportedSignAlgs(), protocolVersion));
+                            getLocalSupportedSignAlgs(), protocolVersion);
+                    handshakeState.update(dhSrvKeyExchange, resumingSession);
+                    this.serverKeyExchange(dhSrvKeyExchange);
                 } catch (GeneralSecurityException e) {
                     throwSSLException("Server key", e);
                 }
@@ -278,10 +293,13 @@ final class ClientHandshaker extends Handshaker {
             case K_ECDHE_RSA:
             case K_ECDH_ANON:
                 try {
-                    this.serverKeyExchange(new ECDH_ServerKeyExchange
+                    ECDH_ServerKeyExchange ecdhSrvKeyExchange =
+                        new ECDH_ServerKeyExchange
                         (input, serverKey, clnt_random.random_bytes,
                         svr_random.random_bytes,
-                        getLocalSupportedSignAlgs(), protocolVersion));
+                            getLocalSupportedSignAlgs(), protocolVersion);
+                    handshakeState.update(ecdhSrvKeyExchange, resumingSession);
+                    this.serverKeyExchange(ecdhSrvKeyExchange);
                 } catch (GeneralSecurityException e) {
                     throwSSLException("Server key", e);
                 }
@@ -320,6 +338,7 @@ final class ClientHandshaker extends Handshaker {
             if (debug != null && Debug.isOn("handshake")) {
                 certRequest.print(System.out);
             }
+            handshakeState.update(certRequest, resumingSession);
 
             if (protocolVersion.v >= ProtocolVersion.TLS12.v) {
                 Collection<SignatureAndHashAlgorithm> peerSignAlgs =
@@ -345,32 +364,22 @@ final class ClientHandshaker extends Handshaker {
             break;
 
         case HandshakeMessage.ht_server_hello_done:
-            this.serverHelloDone(new ServerHelloDone(input));
+            ServerHelloDone serverHelloDone = new ServerHelloDone(input);
+            handshakeState.update(serverHelloDone, resumingSession);
+            this.serverHelloDone(serverHelloDone);
             break;
 
         case HandshakeMessage.ht_finished:
-            // A ChangeCipherSpec record must have been received prior to
-            // reception of the Finished message (RFC 5246, 7.4.9).
-            if (!receivedChangeCipherSpec()) {
-                fatalSE(Alerts.alert_handshake_failure,
-                        "Received Finished message before ChangeCipherSpec");
-            }
+            Finished serverFinished =
+                    new Finished(protocolVersion, input, cipherSuite);
+            handshakeState.update(serverFinished, resumingSession);
+            this.serverFinished(serverFinished);
 
-            this.serverFinished(
-                new Finished(protocolVersion, input, cipherSuite));
             break;
 
         default:
             throw new SSLProtocolException(
                 "Illegal client handshake msg, " + type);
-        }
-
-        //
-        // Move state machine forward if the message handling
-        // code didn't already do so
-        //
-        if (state < type) {
-            state = type;
         }
     }
 
@@ -389,7 +398,7 @@ final class ClientHandshaker extends Handshaker {
         // Could be (e.g. at connection setup) that we already
         // sent the "client hello" but the server's not seen it.
         //
-        if (state < HandshakeMessage.ht_client_hello) {
+        if (!clientHelloDelivered) {
             if (!secureRenegotiation && !allowUnsafeRenegotiation) {
                 // renegotiation is not allowed.
                 if (activeProtocolVersion.v >= ProtocolVersion.TLS10.v) {
@@ -613,7 +622,6 @@ final class ClientHandshaker extends Handshaker {
 
                 // looks fine; resume it, and update the state machine.
                 resumingSession = true;
-                state = HandshakeMessage.ht_finished - 1;
                 calculateConnectionKeys(session.getMasterSecret());
                 if (debug != null && Debug.isOn("session")) {
                     System.out.println("%% Server resumed " + session);
@@ -629,6 +637,54 @@ final class ClientHandshaker extends Handshaker {
                 session = null;
                 if (!enableNewSession) {
                     throw new SSLException("New session creation is disabled");
+                }
+            }
+        }
+
+        // check the "extended_master_secret" extension
+        ExtendedMasterSecretExtension extendedMasterSecretExt =
+                (ExtendedMasterSecretExtension)mesg.extensions.get(
+                        ExtensionType.EXT_EXTENDED_MASTER_SECRET);
+        if (extendedMasterSecretExt != null) {
+            // Is it the expected server extension?
+            if (!useExtendedMasterSecret ||
+                    !(mesgVersion.v >= ProtocolVersion.TLS10.v) || !requestedToUseEMS) {
+                fatalSE(Alerts.alert_unsupported_extension,
+                        "Server sent the extended_master_secret " +
+                        "extension improperly");
+            }
+
+            // For abbreviated handshake, if the original session did not use
+            // the "extended_master_secret" extension but the new ServerHello
+            // contains the extension, the client MUST abort the handshake.
+            if (resumingSession && (session != null) &&
+                    !session.getUseExtendedMasterSecret()) {
+                fatalSE(Alerts.alert_unsupported_extension,
+                        "Server sent an unexpected extended_master_secret " +
+                        "extension on session resumption");
+            }
+        } else {
+            if (useExtendedMasterSecret && !allowLegacyMasterSecret) {
+                // For full handshake, if a client receives a ServerHello
+                // without the extension, it SHOULD abort the handshake if
+                // it does not wish to interoperate with legacy servers.
+                fatalSE(Alerts.alert_handshake_failure,
+                    "Extended Master Secret extension is required");
+            }
+
+            if (resumingSession && (session != null)) {
+                if (session.getUseExtendedMasterSecret()) {
+                    // For abbreviated handshake, if the original session used
+                    // the "extended_master_secret" extension but the new
+                    // ServerHello does not contain the extension, the client
+                    // MUST abort the handshake.
+                    fatalSE(Alerts.alert_handshake_failure,
+                            "Missing Extended Master Secret extension " +
+                            "on session resumption");
+                } else if (useExtendedMasterSecret && !allowLegacyResumption) {
+                    // Unlikely, abbreviated handshake should be discarded.
+                    fatalSE(Alerts.alert_handshake_failure,
+                        "Extended Master Secret extension is required");
                 }
             }
         }
@@ -652,7 +708,8 @@ final class ClientHandshaker extends Handshaker {
             } else if ((type != ExtensionType.EXT_ELLIPTIC_CURVES)
                     && (type != ExtensionType.EXT_EC_POINT_FORMATS)
                     && (type != ExtensionType.EXT_SERVER_NAME)
-                    && (type != ExtensionType.EXT_RENEGOTIATION_INFO)) {
+                    && (type != ExtensionType.EXT_RENEGOTIATION_INFO)
+                    && (type != ExtensionType.EXT_EXTENDED_MASTER_SECRET)){
                 fatalSE(Alerts.alert_unsupported_extension,
                     "Server sent an unsupported extension: " + type);
             }
@@ -661,7 +718,9 @@ final class ClientHandshaker extends Handshaker {
         // Create a new session, we need to do the full handshake
         session = new SSLSessionImpl(protocolVersion, cipherSuite,
                             getLocalSupportedSignAlgs(),
-                            mesg.sessionId, getHostSE(), getPortSE());
+                            mesg.sessionId, getHostSE(), getPortSE(),
+                            (extendedMasterSecretExt != null),
+                            getEndpointIdentificationAlgorithmSE());
         session.setRequestedServerNames(requestedServerNames);
         setHandshakeSessionSE(session);
         if (debug != null && Debug.isOn("handshake")) {
@@ -853,6 +912,7 @@ final class ClientHandshaker extends Handshaker {
                     m1.print(System.out);
                 }
                 m1.write(output);
+                handshakeState.update(m1, resumingSession);
             }
         }
 
@@ -1017,6 +1077,7 @@ final class ClientHandshaker extends Handshaker {
         }
         m2.write(output);
 
+        handshakeState.update(m2, resumingSession);
 
         /*
          * THIRD, send a "change_cipher_spec" record followed by the
@@ -1119,6 +1180,7 @@ final class ClientHandshaker extends Handshaker {
                 m3.print(System.out);
             }
             m3.write(output);
+            handshakeState.update(m3, resumingSession);
             output.doHashes();
         }
 
@@ -1176,6 +1238,8 @@ final class ClientHandshaker extends Handshaker {
         if (resumingSession) {
             input.digestNow();
             sendChangeCipherAndFinish(true);
+        } else {
+            handshakeFinished = true;
         }
         session.setLastAccessedTime(System.currentTimeMillis());
 
@@ -1221,13 +1285,6 @@ final class ClientHandshaker extends Handshaker {
         if (secureRenegotiation) {
             clientVerifyData = mesg.getVerifyData();
         }
-
-        /*
-         * Update state machine so server MUST send 'finished' next.
-         * (In "long" handshake case; in short case, we're responding
-         * to its message.)
-         */
-        state = HandshakeMessage.ht_finished - 1;
     }
 
 
@@ -1295,6 +1352,62 @@ final class ClientHandshaker extends Handshaker {
                     System.out.println("%% can't resume, protocol disabled");
                 }
                 session = null;
+            }
+
+            if ((session != null) && useExtendedMasterSecret) {
+                boolean isTLS10Plus = sessionVersion.v >= ProtocolVersion.TLS10.v;
+                if (isTLS10Plus && !session.getUseExtendedMasterSecret()) {
+                    if (!allowLegacyResumption) {
+                        // perform full handshake instead
+                        //
+                        // The client SHOULD NOT offer an abbreviated handshake
+                        // to resume a session that does not use an extended
+                        // master secret.  Instead, it SHOULD offer a full
+                        // handshake.
+                        session = null;
+                    }
+                }
+
+                if ((session != null) && !allowUnsafeServerCertChange) {
+                    // It is fine to move on with abbreviate handshake if
+                    // endpoint identification is enabled.
+                    String identityAlg = getEndpointIdentificationAlgorithmSE();
+                    if ((identityAlg == null || identityAlg.length() == 0)) {
+                        if (isTLS10Plus) {
+                            if (!session.getUseExtendedMasterSecret()) {
+                                // perform full handshake instead
+                                session = null;
+                            }   // Otherwise, use extended master secret.
+                        } else {
+                            // The extended master secret extension does not
+                            // apply to SSL 3.0.  Perform a full handshake
+                            // instead.
+                            //
+                            // Note that the useExtendedMasterSecret is
+                            // extended to protect SSL 3.0 connections,
+                            // by discarding abbreviate handshake.
+                            session = null;
+                        }
+                    }
+                }
+            }
+
+            // ensure that the endpoint identification algorithm matches the
+            // one in the session
+            String identityAlg = getEndpointIdentificationAlgorithmSE();
+            if (session != null && identityAlg != null) {
+
+                String sessionIdentityAlg =
+                    session.getEndpointIdentificationAlgorithm();
+                if (!Objects.equals(identityAlg, sessionIdentityAlg)) {
+
+                    if (debug != null && Debug.isOn("session")) {
+                        System.out.println("%% can't resume, endpoint id" +
+                            " algorithm does not match, requested: " +
+                            identityAlg + ", cached: " + sessionIdentityAlg);
+                    }
+                    session = null;
+                }
             }
 
             if (session != null) {
@@ -1381,12 +1494,12 @@ final class ClientHandshaker extends Handshaker {
 
         // add elliptic curves and point format extensions
         if (cipherSuites.containsEC()) {
-            SupportedEllipticCurvesExtension ece =
-                SupportedEllipticCurvesExtension.createExtension(algorithmConstraints);
+            EllipticCurvesExtension ece =
+                EllipticCurvesExtension.createExtension(algorithmConstraints);
             if (ece != null) {
                 clientHelloMessage.extensions.add(ece);
                 clientHelloMessage.extensions.add(
-                   SupportedEllipticPointFormatsExtension.DEFAULT);
+                   EllipticPointFormatsExtension.DEFAULT);
             }
         }
 
@@ -1401,6 +1514,14 @@ final class ClientHandshaker extends Handshaker {
             }
 
             clientHelloMessage.addSignatureAlgorithmsExtension(localSignAlgs);
+        }
+
+        // add Extended Master Secret extension
+        if (useExtendedMasterSecret && (maxProtocolVersion.v >= ProtocolVersion.TLS10.v)) {
+            if ((session == null) || session.getUseExtendedMasterSecret()) {
+                clientHelloMessage.addExtendedMasterSecretExtension();
+                requestedToUseEMS = true;
+            }
         }
 
         // add server_name extension
@@ -1463,10 +1584,14 @@ final class ClientHandshaker extends Handshaker {
         // Allow server certificate change in client side during renegotiation
         // after a session-resumption abbreviated initial handshake?
         //
-        // DO NOT need to check allowUnsafeServerCertChange here. We only
+        // DO NOT need to check allowUnsafeServerCertChange here.  We only
         // reserve server certificates when allowUnsafeServerCertChange is
         // flase.
-        if (reservedServerCerts != null) {
+        //
+        // Allow server certificate change if it is negotiated to use the
+        // extended master secret.
+        if ((reservedServerCerts != null) &&
+                !session.getUseExtendedMasterSecret()) {
             // It is not necessary to check the certificate update if endpoint
             // identification is enabled.
             String identityAlg = getEndpointIdentificationAlgorithmSE();

@@ -28,6 +28,7 @@ import java.awt.*;
 
 import java.awt.event.ComponentEvent;
 import java.awt.event.FocusEvent;
+import java.awt.event.InvocationEvent;
 import java.awt.event.WindowEvent;
 
 import java.awt.peer.ComponentPeer;
@@ -38,24 +39,21 @@ import java.io.UnsupportedEncodingException;
 import java.security.AccessController;
 import java.security.PrivilegedAction;
 
-import java.util.ArrayList;
-import java.util.HashSet;
-import java.util.Iterator;
-import java.util.Set;
-import java.util.Vector;
+import java.util.*;
 
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.locks.Condition;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.BooleanSupplier;
+import java.util.function.Consumer;
 
+import sun.awt.*;
 import sun.util.logging.PlatformLogger;
 
-import sun.awt.AWTAccessor;
-import sun.awt.DisplayChangedListener;
-import sun.awt.SunToolkit;
-import sun.awt.X11GraphicsDevice;
-import sun.awt.X11GraphicsEnvironment;
-import sun.awt.IconInfo;
-
 import sun.java2d.pipe.Region;
+
+import javax.swing.*;
 
 class XWindowPeer extends XPanelPeer implements WindowPeer,
                                                 DisplayChangedListener {
@@ -108,10 +106,10 @@ class XWindowPeer extends XPanelPeer implements WindowPeer,
      * The type is supposed to be immutable while the peer object exists.
      * The value gets initialized in the preInit() method.
      */
-    private Window.Type windowType = Window.Type.NORMAL;
+    private Window.Type windowType = getWindowType();
 
-    public final Window.Type getWindowType() {
-        return windowType;
+    final Window.Type getWindowType() {
+        return windowType == null ? Window.Type.NORMAL : windowType;
     }
 
     // It need to be accessed from XFramePeer.
@@ -624,11 +622,10 @@ class XWindowPeer extends XPanelPeer implements WindowPeer,
             target.dispatchEvent(we);
         }
     }
-
-    public void handleWindowFocusInSync(long serial) {
+    public void handleWindowFocusInSync(long serial, Runnable lightweigtRequest) {
         WindowEvent we = new WindowEvent((Window)target, WindowEvent.WINDOW_GAINED_FOCUS);
         XKeyboardFocusManagerPeer.getInstance().setCurrentFocusedWindow((Window) target);
-        sendEvent(we);
+        sendEvent(we, lightweigtRequest);
     }
     // NOTE: This method may be called by privileged threads.
     //       DO NOT INVOKE CLIENT CODE ON THIS THREAD!
@@ -840,7 +837,7 @@ class XWindowPeer extends XPanelPeer implements WindowPeer,
         if (focusLog.isLoggable(PlatformLogger.Level.FINE)) {
             focusLog.fine("Requesting window focus");
         }
-        requestWindowFocus(time, timeProvided);
+        requestWindowFocus(time, timeProvided, () -> {}, () -> {});
     }
 
     public final boolean focusAllowedFor() {
@@ -1137,6 +1134,13 @@ class XWindowPeer extends XPanelPeer implements WindowPeer,
     }
 
     protected void suppressWmTakeFocus(boolean doSuppress) {
+        XAtomList protocols = getWMProtocols();
+        if (doSuppress) {
+            protocols.remove(wm_take_focus);
+        } else {
+            protocols.add(wm_take_focus);
+        }
+        wm_protocols.setAtomListProperty(this, protocols);
     }
 
     final boolean isSimpleWindow() {
@@ -1222,7 +1226,8 @@ class XWindowPeer extends XPanelPeer implements WindowPeer,
 
     boolean isOverrideRedirect() {
         return XWM.getWMID() == XWM.OPENLOOK_WM ||
-            Window.Type.POPUP.equals(getWindowType());
+            (Window.Type.POPUP.equals(getWindowType()) &&
+            !isDialogLikePopup(getTarget()));
     }
 
     final boolean isOLWMDecorBug() {
@@ -1265,7 +1270,8 @@ class XWindowPeer extends XPanelPeer implements WindowPeer,
                 Window target = (Window) this.target;
                 Window owner = target.getOwner();
                 if (owner != null) {
-                    ((XWindowPeer)AWTAccessor.getComponentAccessor().getPeer(owner)).requestWindowFocus();
+                    ((XWindowPeer)AWTAccessor.getComponentAccessor().getPeer(owner)).
+                            requestWindowFocus(() -> {}, () -> {});
                 }
             }
         }
@@ -1388,7 +1394,12 @@ class XWindowPeer extends XPanelPeer implements WindowPeer,
              */
             XToolkit.awtLock();
             try {
-                XlibWrapper.XRaiseWindow(XToolkit.getDisplay(), getWindow());
+                if (XlibUtil.isRaiseAllowed())
+                {
+                    XlibWrapper.XLowerWindow(XToolkit.getDisplay(), getWindow());
+                } else {
+                    XlibWrapper.XRaiseWindow(XToolkit.getDisplay(), getWindow());
+                }
             } finally {
                 XToolkit.awtUnlock();
             }
@@ -1659,6 +1670,16 @@ class XWindowPeer extends XPanelPeer implements WindowPeer,
         while (!XlibUtil.isToplevelWindow(tpw) && !XlibUtil.isXAWTToplevelWindow(tpw)) {
             tpw = XlibUtil.getParentWindow(tpw);
         }
+
+        XBaseWindow parent = transientForWindow;
+        if (parent instanceof XLightweightFramePeer) {
+            XLightweightFramePeer peer = (XLightweightFramePeer) parent;
+            long ownerWindowPtr = peer.getOverriddenWindowHandle();
+            if (ownerWindowPtr != 0) {
+                tpw = ownerWindowPtr;
+            }
+        }
+
         XlibWrapper.XSetTransientFor(XToolkit.getDisplay(), bpw, tpw);
         window.curRealTransientFor = transientForWindow;
     }
@@ -1899,16 +1920,25 @@ class XWindowPeer extends XPanelPeer implements WindowPeer,
         return window;
     }
 
-    public boolean requestWindowFocus(XWindowPeer actualFocusedWindow) {
+    public boolean requestWindowFocus(XWindowPeer actualFocusedWindow, Runnable lightweigtRequest, Runnable rejectFocusRequest) {
         setActualFocusedWindow(actualFocusedWindow);
-        return requestWindowFocus();
+        return requestWindowFocus(lightweigtRequest, rejectFocusRequest);
     }
 
     public boolean requestWindowFocus() {
-        return requestWindowFocus(0, false);
+        return requestWindowFocus(() -> {}, () -> {});
+    }
+
+    public boolean requestWindowFocus(Runnable lightweigtRequest, Runnable rejectFocusRequest) {
+        return requestWindowFocus(0, false, lightweigtRequest, rejectFocusRequest);
     }
 
     public boolean requestWindowFocus(long time, boolean timeProvided) {
+        return requestWindowFocus(time, timeProvided, () -> {}, () -> {});
+    }
+
+    public boolean requestWindowFocus(long time, boolean timeProvided,
+                                      Runnable lightweigtRequest, Runnable rejectFocusRequest) {
         focusLog.fine("Request for window focus");
         // If this is Frame or Dialog we can't assure focus request success - but we still can try
         // If this is Window and its owner Frame is active we can be sure request succedded.
@@ -1918,11 +1948,12 @@ class XWindowPeer extends XPanelPeer implements WindowPeer,
 
         if (isWMStateNetHidden()) {
             focusLog.fine("The window is unmapped, so rejecting the request");
+            rejectFocusRequest.run();
             return false;
         }
         if (activeWindow == ownerWindow) {
             focusLog.fine("Parent window is active - generating focus for this window");
-            handleWindowFocusInSync(-1);
+            handleWindowFocusInSync(-1, lightweigtRequest);
             return true;
         }
         focusLog.fine("Parent window is not active");
@@ -1930,9 +1961,11 @@ class XWindowPeer extends XPanelPeer implements WindowPeer,
         XDecoratedPeer wpeer = (XDecoratedPeer)AWTAccessor.getComponentAccessor().getPeer(ownerWindow);
         if (wpeer != null && wpeer.requestWindowFocus(this, time, timeProvided)) {
             focusLog.fine("Parent window accepted focus request - generating focus for this window");
+            handleWindowFocusInSync(-1, lightweigtRequest);
             return true;
         }
         focusLog.fine("Denied - parent window is not active and didn't accept focus request");
+        rejectFocusRequest.run();
         return false;
     }
 
@@ -1962,7 +1995,9 @@ class XWindowPeer extends XPanelPeer implements WindowPeer,
                 typeAtom = protocol.XA_NET_WM_WINDOW_TYPE_UTILITY;
                 break;
             case POPUP:
-                typeAtom = protocol.XA_NET_WM_WINDOW_TYPE_POPUP_MENU;
+                typeAtom = isDialogLikePopup(getTarget()) ?
+                  protocol.XA_NET_WM_WINDOW_TYPE_NORMAL :
+                  protocol.XA_NET_WM_WINDOW_TYPE_POPUP_MENU;
                 break;
         }
 
@@ -1977,6 +2012,20 @@ class XWindowPeer extends XPanelPeer implements WindowPeer,
         }
     }
 
+    boolean isDialogLikePopup (Object t) {
+        if (t instanceof JWindow) {
+            final JWindow target = (JWindow) getTarget();
+            final JRootPane rootPane = target.getRootPane();
+            if (rootPane != null) {
+                final Object value = rootPane.getClientProperty("SIMPLE_WINDOW");
+                if (value != null && (Boolean)value) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
     @Override
     public void xSetVisible(boolean visible) {
         if (log.isLoggable(PlatformLogger.Level.FINE)) {
@@ -1987,7 +2036,11 @@ class XWindowPeer extends XPanelPeer implements WindowPeer,
             this.visible = visible;
             if (visible) {
                 applyWindowType();
-                XlibWrapper.XMapRaised(XToolkit.getDisplay(), getWindow());
+                if (XlibUtil.isRaiseAllowed()) {
+                    XlibWrapper.XMapWindow(XToolkit.getDisplay(), getWindow());
+                } else {
+                    XlibWrapper.XMapRaised(XToolkit.getDisplay(), getWindow());
+                }
             } else {
                 XlibWrapper.XUnmapWindow(XToolkit.getDisplay(), getWindow());
             }

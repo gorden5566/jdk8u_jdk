@@ -24,20 +24,19 @@
  */
 package sun.awt.windows;
 
-import java.awt.AlphaComposite;
-import java.awt.Color;
-import java.awt.Graphics2D;
-import java.awt.GraphicsConfiguration;
-import java.awt.Image;
-import java.awt.Window;
+import java.awt.*;
+import java.awt.geom.AffineTransform;
 import java.awt.image.BufferedImage;
 import java.awt.image.DataBufferInt;
+import java.awt.image.Raster;
 import java.awt.image.VolatileImage;
 import java.security.AccessController;
 import sun.awt.image.BufImgSurfaceData;
+import sun.awt.image.SunVolatileImage;
 import sun.java2d.DestSurfaceProvider;
 import sun.java2d.InvalidPipeException;
 import sun.java2d.Surface;
+import sun.java2d.SurfaceData;
 import sun.java2d.pipe.RenderQueue;
 import sun.java2d.pipe.BufferedContext;
 import sun.java2d.pipe.hw.AccelGraphicsConfig;
@@ -122,6 +121,13 @@ abstract class TranslucentWindowPainter {
      */
     public abstract void flush();
 
+    protected boolean checkScaleValid(Image image) {
+        if (!(image instanceof SunVolatileImage)) return true;
+        SurfaceData sd = (SurfaceData)((SunVolatileImage)image).getDestSurface();
+        AffineTransform tx = window.getGraphicsConfiguration().getDefaultTransform();
+        return tx.getScaleX() == sd.getDefaultScaleX() && tx.getScaleY() == sd.getDefaultScaleY();
+    }
+
     /**
      * Updates the window associated with the painter.
      *
@@ -170,7 +176,7 @@ abstract class TranslucentWindowPainter {
      * method (VI, BI, regular Images).
      */
     private static class BIWindowPainter extends TranslucentWindowPainter {
-        private BufferedImage backBuffer;
+        private Image backBuffer;
 
         protected BIWindowPainter(WWindowPeer peer) {
             super(peer);
@@ -181,13 +187,33 @@ abstract class TranslucentWindowPainter {
             int w = window.getWidth();
             int h = window.getHeight();
             if (backBuffer == null ||
-                backBuffer.getWidth() != w ||
-                backBuffer.getHeight() != h)
+                backBuffer.getWidth(null) != w ||
+                backBuffer.getHeight(null) != h ||
+                !checkScaleValid(backBuffer))
             {
+                Image oldBackBuffer = backBuffer;
                 flush();
-                backBuffer = new BufferedImage(w, h, BufferedImage.TYPE_INT_ARGB_PRE);
+                // [tav] BufferedImage is not hidpi-aware, create a VolatileImage backed by a hidpi-aware BufImgSurfaceData
+//                backBuffer = new BufferedImage(w, h, BufferedImage.TYPE_INT_ARGB_PRE);
+                GraphicsConfiguration gc = peer.getGraphicsConfiguration();
+                try {
+                    backBuffer = gc.createCompatibleVolatileImage(w, h, new ImageCapabilities(false), TRANSLUCENT);
+                    paintOld(oldBackBuffer, backBuffer);
+                } catch (AWTException e) {
+                    e.printStackTrace();
+                }
             }
-            return clear ? (BufferedImage)clearImage(backBuffer) : backBuffer;
+            return clear ? clearImage(backBuffer) : backBuffer;
+        }
+
+        protected void paintOld(Image oldImage, Image newImage) {
+            if (oldImage != null) {
+                clearImage(newImage);
+                Graphics2D g = (Graphics2D)newImage.getGraphics();
+                g.setComposite(AlphaComposite.Src);
+                g.setColor(new Color(0, 0, 0, 0));
+                g.drawImage(oldImage, 0, 0, null);
+            }
         }
 
         @Override
@@ -208,12 +234,10 @@ abstract class TranslucentWindowPainter {
                         // the image is probably lost, upload the data from the
                         // backup surface to avoid creating another heap-based
                         // image (the parent's buffer)
-                        int w = viBB.getWidth();
-                        int h = viBB.getHeight();
                         BufImgSurfaceData bisd = (BufImgSurfaceData)s;
-                        int data[] = ((DataBufferInt)bisd.getRaster(0,0,w,h).
-                            getDataBuffer()).getData();
-                        peer.updateWindowImpl(data, w, h);
+                        Raster raster = bisd.getRaster(0,0, 0, 0);
+                        int data[] = ((DataBufferInt)raster.getDataBuffer()).getData();
+                        peer.updateWindowImpl(data, raster.getWidth(), raster.getHeight());
                         return true;
                     }
                 }
@@ -257,8 +281,10 @@ abstract class TranslucentWindowPainter {
             GraphicsConfiguration gc = peer.getGraphicsConfiguration();
 
             if (viBB == null || viBB.getWidth() != w || viBB.getHeight() != h ||
-                viBB.validate(gc) == IMAGE_INCOMPATIBLE)
+                viBB.validate(gc) == IMAGE_INCOMPATIBLE ||
+                !checkScaleValid(viBB))
             {
+                Image oldViBB = viBB;
                 flush();
 
                 if (gc instanceof AccelGraphicsConfig) {
@@ -270,6 +296,7 @@ abstract class TranslucentWindowPainter {
                 if (viBB == null) {
                     viBB = gc.createCompatibleVolatileImage(w, h, TRANSLUCENT);
                 }
+                paintOld(oldViBB, viBB);
                 viBB.validate(gc);
             }
 
@@ -303,8 +330,9 @@ abstract class TranslucentWindowPainter {
             if (bb instanceof DestSurfaceProvider) {
                 Surface s = ((DestSurfaceProvider)bb).getDestSurface();
                 if (s instanceof AccelSurface) {
-                    final int w = bb.getWidth(null);
-                    final int h = bb.getHeight(null);
+                    Rectangle bounds = ((SurfaceData)s).getBounds();
+                    final int w = bounds.width;
+                    final int h = bounds.height;
                     final boolean arr[] = { false };
                     final AccelSurface as = (AccelSurface)s;
                     RenderQueue rq = as.getContext().getRenderQueue();

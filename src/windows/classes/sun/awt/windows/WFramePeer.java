@@ -111,6 +111,23 @@ class WFramePeer extends WWindowPeer implements FramePeer {
     }
 
     @Override
+    public void displayChanged() {
+        super.displayChanged();
+        updateIcon();
+        if (!screenChangedFlag &&
+            (getExtendedState() & Frame.MAXIMIZED_BOTH) != 0 &&
+            (getExtendedState() & Frame.ICONIFIED) == 0)
+        {
+            // A workaround to update the maximized state of the frame
+            int state = getExtendedState();
+            setState(Frame.NORMAL);
+            setState(state);
+        }
+    }
+
+    private native void updateIcon();
+
+    @Override
     public boolean updateGraphicsData(GraphicsConfiguration gc) {
         boolean result = super.updateGraphicsData(gc);
         Rectangle bounds = AWTAccessor.getFrameAccessor().

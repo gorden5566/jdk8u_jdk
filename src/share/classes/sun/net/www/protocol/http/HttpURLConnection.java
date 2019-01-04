@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 1995, 2013, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 1995, 2018, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -825,18 +825,36 @@ public class HttpURLConnection extends java.net.HttpURLConnection {
         this(u, null, handler);
     }
 
-    public HttpURLConnection(URL u, String host, int port) {
-        this(u, new Proxy(Proxy.Type.HTTP, InetSocketAddress.createUnresolved(host, port)));
+    private static String checkHost(String h) throws IOException {
+        if (h != null) {
+            if (h.indexOf('\n') > -1) {
+                throw new MalformedURLException("Illegal character in host");
+            }
+        }
+        return h;
+    }
+    public HttpURLConnection(URL u, String host, int port) throws IOException {
+        this(u, new Proxy(Proxy.Type.HTTP,
+                InetSocketAddress.createUnresolved(checkHost(host), port)));
     }
 
     /** this constructor is used by other protocol handlers such as ftp
         that want to use http to fetch urls on their behalf.*/
-    public HttpURLConnection(URL u, Proxy p) {
+    public HttpURLConnection(URL u, Proxy p) throws IOException {
         this(u, p, new Handler());
     }
 
-    protected HttpURLConnection(URL u, Proxy p, Handler handler) {
-        super(u);
+    private static URL checkURL(URL u) throws IOException {
+        if (u != null) {
+            if (u.toExternalForm().indexOf('\n') > -1) {
+                throw new MalformedURLException("Illegal character in URL");
+            }
+        }
+        return u;
+    }
+    protected HttpURLConnection(URL u, Proxy p, Handler handler)
+            throws IOException {
+        super(checkURL(u));
         requests = new MessageHeader();
         responses = new MessageHeader();
         userHeaders = new MessageHeader();
@@ -2668,6 +2686,8 @@ public class HttpURLConnection extends java.net.HttpURLConnection {
             // doesn't know about proxy.
             useProxyResponseCode = true;
         } else {
+            final URL prevURL = url;
+
             // maintain previous headers, just change the name
             // of the file we're getting
             url = locUrl;
@@ -2696,6 +2716,14 @@ public class HttpURLConnection extends java.net.HttpURLConnection {
                 poster = null;
                 if (!checkReuseConnection())
                     connect();
+
+                if (!sameDestination(prevURL, url)) {
+                    // Ensures pre-redirect user-set cookie will not be reset.
+                    // CookieHandler, if any, will be queried to determine
+                    // cookies for redirected URL, if any.
+                    userCookies = null;
+                    userCookies2 = null;
+                }
             } else {
                 if (!checkReuseConnection())
                     connect();
@@ -2718,8 +2746,49 @@ public class HttpURLConnection extends java.net.HttpURLConnection {
                     }
                     requests.set("Host", host);
                 }
+
+                if (!sameDestination(prevURL, url)) {
+                    // Redirecting to a different destination will drop any
+                    // security-sensitive headers, regardless of whether
+                    // they are user-set or not. CookieHandler, if any, will be
+                    // queried to determine cookies for redirected URL, if any.
+                    userCookies = null;
+                    userCookies2 = null;
+                    requests.remove("Cookie");
+                    requests.remove("Cookie2");
+                    requests.remove("Authorization");
+
+                    // check for preemptive authorization
+                    AuthenticationInfo sauth =
+                            AuthenticationInfo.getServerAuth(url);
+                    if (sauth != null && sauth.supportsPreemptiveAuthorization() ) {
+                        // Sets "Authorization"
+                        requests.setIfNotSet(sauth.getHeaderName(), sauth.getHeaderValue(url,method));
+                        currentServerCredentials = sauth;
+                    }
+                }
             }
         }
+        return true;
+    }
+
+    /* Returns true iff the given URLs have the same host and effective port. */
+    private static boolean sameDestination(URL firstURL, URL secondURL) {
+        assert firstURL.getProtocol().equalsIgnoreCase(secondURL.getProtocol()):
+               "protocols not equal: " + firstURL +  " - " + secondURL;
+
+        if (!firstURL.getHost().equalsIgnoreCase(secondURL.getHost()))
+            return false;
+
+        int firstPort = firstURL.getPort();
+        if (firstPort == -1)
+            firstPort = firstURL.getDefaultPort();
+        int secondPort = secondURL.getPort();
+        if (secondPort == -1)
+            secondPort = secondURL.getDefaultPort();
+        if (firstPort != secondPort)
+            return false;
+
         return true;
     }
 

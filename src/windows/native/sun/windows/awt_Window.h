@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 1996, 2013, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 1996, 2018, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -63,6 +63,8 @@ public:
     static jfieldID sysWID;
     static jfieldID sysHID;
 
+    static jfieldID sysInsetsID;
+
     static jfieldID windowTypeID;
 
     static jmethodID getWarningStringMID;
@@ -104,10 +106,6 @@ public:
         VERIFY(::CopyRect(rect, &m_insets));
     }
 
-    virtual void GetAlignedInsets(RECT* rect) {
-        VERIFY(::CopyRect(rect, &m_aligned_insets));
-    }
-
     /* to make embedded frames easier */
     virtual BOOL IsEmbeddedFrame() { return FALSE;}
 
@@ -137,7 +135,7 @@ public:
     virtual void RecalcNonClient();
     virtual void RedrawNonClient();
     virtual int  GetScreenImOn();
-    virtual void CheckIfOnNewScreen();
+    virtual BOOL CheckIfOnNewScreen();
     virtual void Grab();
     virtual void Ungrab();
     virtual void Ungrab(BOOL doPost);
@@ -248,7 +246,9 @@ public:
     static void _UpdateWindow(void* param);
     static void _RepositionSecurityWarning(void* param);
     static void _SetFullScreenExclusiveModeState(void* param);
+    static void _OverrideHandle(void *param);
     static void _GetNativeWindowSize(void* param);
+    static void _AdjustBoundsOnDPIChange(void* param);
 
     inline static BOOL IsResizing() {
         return sm_resizing;
@@ -264,6 +264,9 @@ public:
 
     static void FocusedWindowChanged(HWND from, HWND to);
 
+    inline HWND GetOverriddenHWnd() { return m_overriddenHwnd; }
+    inline void OverrideHWnd(HWND hwnd) { m_overriddenHwnd = hwnd; }
+
 private:
     static int ms_instanceCounter;
     static HHOOK ms_hCBTFilter;
@@ -272,7 +275,6 @@ private:
 
     RECT m_insets;          /* a cache of the insets being used */
     RECT m_old_insets;      /* help determine if insets change */
-    RECT m_aligned_insets;  /* transformed to user space and back to device scape */
     POINT m_sizePt;         /* the last value of WM_SIZE */
     RECT m_warningRect;     /* The window's warning banner area, if any. */
     AwtFrame *m_owningFrameDialog; /* The nearest Frame/Dialog which owns us */
@@ -282,6 +284,8 @@ private:
     BOOL m_isRetainingHierarchyZOrder; // Is this a window that shouldn't change z-order of any window
                                        // from its hierarchy when shown. Currently applied to instances of
                                        // javax/swing/Popup$HeavyWeightWindow class.
+
+    RECT m_boundsOnDPIChange; /* bounds to asynchronously adjust on DPI change */
 
     // SetTranslucency() is the setter for the following two fields
     BYTE m_opacity;         // The opacity level. == 0xff by default (when opacity mode is disabled)
@@ -315,6 +319,9 @@ private:
     HWND warningWindow;
     // The tooltip that appears when hovering the icon
     HWND securityTooltipWindow;
+
+    //Allows substitute parent window with JavaFX stage to make it below a dialog
+    HWND m_overriddenHwnd;
 
     UINT warningWindowWidth;
     UINT warningWindowHeight;

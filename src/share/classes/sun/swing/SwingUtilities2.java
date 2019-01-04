@@ -140,9 +140,7 @@ public class SwingUtilities2 {
             Object aaHint   = hints.get(KEY_TEXT_ANTIALIASING);
             Object contHint = hints.get(KEY_TEXT_LCD_CONTRAST);
 
-            if (aaHint == null ||
-                aaHint == VALUE_TEXT_ANTIALIAS_OFF ||
-                aaHint == VALUE_TEXT_ANTIALIAS_DEFAULT) {
+            if (aaHint == null) {
                 return null;
             } else {
                 return new AATextInfo(aaHint, (Integer)contHint);
@@ -172,10 +170,6 @@ public class SwingUtilities2 {
         public AATextInfo(Object aaHint, Integer lcdContrastHint) {
             if (aaHint == null) {
                 throw new InternalError("null not allowed here");
-            }
-            if (aaHint == VALUE_TEXT_ANTIALIAS_OFF ||
-                aaHint == VALUE_TEXT_ANTIALIAS_DEFAULT) {
-                throw new InternalError("AA must be on");
             }
             this.aaHint = aaHint;
             this.lcdContrastHint = lcdContrastHint;
@@ -939,8 +933,17 @@ public class SwingUtilities2 {
                                           FontMetrics fm,
                                           boolean useFPAPI)
     {
-        return len == 0 ? 0 : getFontStringWidth(new String(data, offset, len),
-                                                 fm, useFPAPI);
+        if (len == 0) {
+            return 0;
+        }
+        if (useFPAPI) {
+            Rectangle2D bounds = fm.getFont().
+                                     getStringBounds(data, offset, offset + len,
+                                                     fm.getFontRenderContext());
+            return (float) bounds.getWidth();
+        } else {
+            return fm.charsWidth(data, offset, len);
+        }
     }
 
     public static float getFontStringWidth(String data, FontMetrics fm,

@@ -288,6 +288,18 @@ public class CInputMethod extends InputMethodAdapter {
             if (component.getInputMethodRequests() == null) {
                 imInstance = null;
             }
+
+            LWWindowPeer windowPeer = peer.getPlatformWindow().getPeer();
+            if (windowPeer.isSimpleWindow()) {
+                // A simple window gains focus. Cocoa won't dispatch IME events into the simple window, but into its owner.
+                // This IM represents the focused component in the simple window. We will use the owner as IME proxy.
+                // For that, this IM is set for the owner and is dropped for the simple window.
+                Window owner = windowPeer.getTarget().getOwner();
+                assert owner != null && owner.isActive();
+                long ownerPtr = getNativeViewPtr((LWComponentPeer)owner.getPeer());
+                nativeNotifyPeer(ownerPtr, this);
+                imInstance = null;
+            }
         }
 
         if (peer != null) {
@@ -580,9 +592,10 @@ public class CInputMethod extends InputMethodAdapter {
      * substring.
      */
     synchronized private String attributedSubstringFromRange(final int locationIn, final int lengthIn) {
-        final String[] retString = new String[1];
+        final String[] retString = new String[] {""};
 
         try {
+            if (fIMContext != null)
             LWCToolkit.invokeAndWait(new Runnable() {
                 public void run() { synchronized(retString) {
                     int location = locationIn;
@@ -635,6 +648,7 @@ public class CInputMethod extends InputMethodAdapter {
         final int[] returnValue = new int[2];
 
         try {
+            if (fIMContext != null)
             LWCToolkit.invokeAndWait(new Runnable() {
                 public void run() { synchronized(returnValue) {
                     AttributedCharacterIterator theIterator = fIMContext.getSelectedText(null);
@@ -710,6 +724,7 @@ public class CInputMethod extends InputMethodAdapter {
         final int[] rect = new int[4];
 
         try {
+            if (fIMContext != null)
             LWCToolkit.invokeAndWait(new Runnable() {
                 public void run() { synchronized(rect) {
                     int insertOffset = fIMContext.getInsertPositionOffset();
@@ -728,7 +743,7 @@ public class CInputMethod extends InputMethodAdapter {
                     if (composedTextOffset > 0 && (fAwtFocussedComponent instanceof JTextComponent)) {
                         Rectangle r2 = fIMContext.getTextLocation(TextHitInfo.beforeOffset(0));
 
-                        if (r.equals(r2)) {
+                        if (r.equals(r2) && fCurrentTextAsString != null) {
                             // FIXME: (SAK) If the candidate text wraps over two lines, this calculation pushes the candidate
                             // window off the right edge of the component.
                             String inProgressSubstring = fCurrentTextAsString.substring(0, composedTextOffset);
@@ -754,6 +769,7 @@ public class CInputMethod extends InputMethodAdapter {
         final int[] insertPositionOffset = new int[1];
 
         try {
+            if (fIMContext != null)
             LWCToolkit.invokeAndWait(new Runnable() {
                 public void run() { synchronized(offsetInfo) {
                     offsetInfo[0] = fIMContext.getLocationOffset(screenX, screenY);

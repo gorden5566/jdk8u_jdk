@@ -169,7 +169,8 @@ AwtFrame* AwtFrame::Create(jobject self, jobject parent)
             JNI_CHECK_PEER_GOTO(parent, done);
             {
                 AwtFrame* parent = (AwtFrame *)pData;
-                hwndParent = parent->GetHWnd();
+                HWND oHWnd = parent->GetOverriddenHWnd();
+                hwndParent = oHWnd ? oHWnd : parent->GetHWnd();
             }
         }
 
@@ -1188,6 +1189,19 @@ MsgRouting AwtFrame::WmGetIcon(WPARAM iconType, LRESULT& retVal)
     }
 }
 
+void _UpdateIcon(void* p) {
+    JNIEnv *env = (JNIEnv *)JNU_GetEnv(jvm, JNI_VERSION_1_2);
+
+    jobject self = reinterpret_cast<jobject>(p);
+    PDATA pData;
+    JNI_CHECK_PEER_GOTO(self, ret);
+
+    AwtFrame* frame = (AwtFrame*)pData;
+    frame->DoUpdateIcon();
+ret:
+    env->DeleteGlobalRef(self);
+}
+
 void AwtFrame::DoUpdateIcon()
 {
     //Workaround windows bug:
@@ -1204,7 +1218,7 @@ HICON AwtFrame::GetEffectiveIcon(int iconType)
     BOOL smallIcon = ((iconType == ICON_SMALL) || (iconType == 2/*ICON_SMALL2*/));
     HICON hIcon = (smallIcon) ? GetHIconSm() : GetHIcon();
     if (hIcon == NULL) {
-        hIcon = (smallIcon) ? AwtToolkit::GetInstance().GetAwtIconSm() :
+        hIcon = (smallIcon) ? AwtToolkit::GetInstance().GetAwtIconSm(reinterpret_cast<void*>(this)) :
             AwtToolkit::GetInstance().GetAwtIcon();
     }
     return hIcon;
@@ -1240,6 +1254,22 @@ MsgRouting AwtFrame::WmSysCommand(UINT uCmdType, int xPos, int yPos)
         return mrConsume;
     }
     return AwtWindow::WmSysCommand(uCmdType, xPos, yPos);
+}
+
+MsgRouting AwtFrame::WmDPIChanged(UINT xDPI, UINT yDPI, RECT* bounds) {
+    if (isZoomed()) {
+        Devices::InstanceAccess devices;
+        AwtWin32GraphicsDevice* device = devices->GetDevice(AwtWin32GraphicsDevice::DeviceIndexForWindow(GetHWnd()));
+        if (device) {
+            float factorX = xDPI / 96.0f / device->GetScaleX();
+            float factorY = yDPI / 96.0f / device->GetScaleY();
+
+            // adjust rcNormalPosition for the zoomed frame
+            AwtFrame::__SetState(this, AwtFrame::__GetState(this), factorX, factorY);
+            return mrConsume;
+        }
+    }
+    return AwtWindow::WmDPIChanged(xDPI, yDPI, bounds);
 }
 
 LRESULT AwtFrame::WinThreadExecProc(ExecuteArgs * args)
@@ -1352,6 +1382,15 @@ void AwtFrame::_SetState(void *param)
     PDATA pData;
     JNI_CHECK_PEER_GOTO(self, ret);
     f = (AwtFrame *)pData;
+    AwtFrame::__SetState(f, state);
+ret:
+    env->DeleteGlobalRef(self);
+
+    delete sss;
+}
+
+void AwtFrame::__SetState(AwtFrame* f, int state, float factorX, float factorY)
+{
     HWND hwnd = f->GetHWnd();
     if (::IsWindow(hwnd))
     {
@@ -1374,6 +1413,11 @@ void AwtFrame::_SetState(void *param)
             ::ZeroMemory(&wp, sizeof(wp));
             wp.length = sizeof(wp);
             ::GetWindowPlacement(hwnd, &wp);
+
+            wp.rcNormalPosition.left *= factorX;
+            wp.rcNormalPosition.right *= factorX;
+            wp.rcNormalPosition.top *= factorY;
+            wp.rcNormalPosition.bottom *= factorY;
 
             // Iconify first.
             // If both iconify & zoom are TRUE, handle this case
@@ -1409,10 +1453,6 @@ void AwtFrame::_SetState(void *param)
             f->setZoomed(zoom);
         }
     }
-ret:
-    env->DeleteGlobalRef(self);
-
-    delete sss;
 }
 
 jint AwtFrame::_GetState(void *param)
@@ -1421,12 +1461,21 @@ jint AwtFrame::_GetState(void *param)
 
     jobject self = (jobject)param;
 
-    jint result = java_awt_Frame_NORMAL;
     AwtFrame *f = NULL;
 
     PDATA pData;
     JNI_CHECK_PEER_GOTO(self, ret);
     f = (AwtFrame *)pData;
+    jint result = AwtFrame::__GetState(f);
+ret:
+    env->DeleteGlobalRef(self);
+
+    return result;
+}
+
+jint AwtFrame::__GetState(AwtFrame* f)
+{
+    jint result = java_awt_Frame_NORMAL;
     if (::IsWindow(f->GetHWnd()))
     {
         DASSERT(!::IsBadReadPtr(f, sizeof(AwtFrame)));
@@ -1441,9 +1490,6 @@ jint AwtFrame::_GetState(void *param)
                   f->isIconic() ? " iconic" : "",
                   f->isZoomed() ? " zoomed" : "");
     }
-ret:
-    env->DeleteGlobalRef(self);
-
     return result;
 }
 
@@ -1466,6 +1512,10 @@ void AwtFrame::_SetMaximizedBounds(void *param)
     if (::IsWindow(f->GetHWnd()))
     {
         DASSERT(!::IsBadReadPtr(f, sizeof(AwtFrame)));
+        x = f->ScaleUpDX(x);
+        y = f->ScaleUpDY(y);
+        width = f->ScaleUpX(width);
+        height = f->ScaleUpY(height);
         f->SetMaximizedBounds(x, y, width, height);
     }
 ret:
@@ -1581,12 +1631,12 @@ void AwtFrame::_NotifyModalBlocked(void *param)
 
     PDATA pData;
 
-    pData = JNI_GET_PDATA(peer);
+    JNI_CHECK_PEER_GOTO(peer, ret);
     AwtFrame *f = (AwtFrame *)pData;
 
     // dialog here may be NULL, for example, if the blocker is a native dialog
     // however, we need to install/unistall modal hooks anyway
-    pData = JNI_GET_PDATA(blockerPeer);
+    JNI_CHECK_PEER_GOTO(blockerPeer, ret);
     AwtDialog *d = (AwtDialog *)pData;
 
     if ((f != NULL) && ::IsWindow(f->GetHWnd()))
@@ -1638,7 +1688,7 @@ void AwtFrame::_NotifyModalBlocked(void *param)
             }
         }
     }
-
+ret:
     env->DeleteGlobalRef(self);
     env->DeleteGlobalRef(peer);
     env->DeleteGlobalRef(blockerPeer);
@@ -1810,8 +1860,6 @@ Java_sun_awt_windows_WFramePeer_createAwtFrame(JNIEnv *env, jobject self,
     AwtToolkit::CreateComponent(self, parent,
                                 (AwtToolkit::ComponentFactory)
                                 AwtFrame::Create);
-    PDATA pData;
-    JNI_CHECK_PEER_CREATION_RETURN(self);
 
     CATCH_BAD_ALLOC;
 }
@@ -1925,8 +1973,6 @@ Java_sun_awt_windows_WEmbeddedFramePeer_create(JNIEnv *env, jobject self,
     AwtToolkit::CreateComponent(self, parent,
                                 (AwtToolkit::ComponentFactory)
                                 AwtFrame::Create);
-    PDATA pData;
-    JNI_CHECK_PEER_CREATION_RETURN(self);
 
     CATCH_BAD_ALLOC;
 }
@@ -1970,6 +2016,17 @@ Java_sun_awt_windows_WFramePeer_synthesizeWmActivate(JNIEnv *env, jobject self, 
      */
     AwtToolkit::GetInstance().InvokeFunction(AwtFrame::_SynthesizeWmActivate, sas);
     // global ref and sas are deleted in _SynthesizeWmActivate()
+
+    CATCH_BAD_ALLOC;
+}
+
+JNIEXPORT void JNICALL
+Java_sun_awt_windows_WFramePeer_updateIcon(JNIEnv *env, jobject self)
+{
+    TRY;
+
+    AwtToolkit::GetInstance().InvokeFunction(_UpdateIcon, env->NewGlobalRef(self));
+    // global ref is deleted in _UpdateIcon()
 
     CATCH_BAD_ALLOC;
 }

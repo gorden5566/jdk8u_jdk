@@ -328,21 +328,27 @@ public class XComponentPeer extends XWindow implements ComponentPeer, DropTarget
                * when a component inside a Frame is requesting focus.
                * See 6314575 for details.
                */
-              boolean res = wpeer.requestWindowFocus(null);
 
-              if (focusLog.isLoggable(PlatformLogger.Level.FINER)) {
-                  focusLog.finer("Requested window focus: " + res);
-              }
               // If parent window can be made focused and has been made focused(synchronously)
               // then we can proceed with children, otherwise we retreat.
-              if (!res) {
-                  return rejectFocusRequestHelper("Waiting for asynchronous processing of the request");
-              }
-              return XKeyboardFocusManagerPeer.deliverFocus(lightweightChild,
-                                                            (Component)target,
-                                                            temporary,
-                                                            focusedWindowChangeAllowed,
-                                                            time, cause);
+
+              return wpeer.requestWindowFocus(null, () -> {
+                  if (focusLog.isLoggable(PlatformLogger.Level.FINER)) {
+                      focusLog.finer("Requested window focus: true");
+                  }
+                  XKeyboardFocusManagerPeer.deliverFocus(lightweightChild,
+                          (Component)target,
+                          temporary,
+                          focusedWindowChangeAllowed,
+                          time, cause);
+              }, () -> {
+                  if (focusLog.isLoggable(PlatformLogger.Level.FINER)) {
+                      focusLog.finer("Requested window focus: false");
+                  }
+                  rejectFocusRequestHelper("Waiting for asynchronous processing of the request");
+              });
+
+
               // Motif compatibility code
           case XKeyboardFocusManagerPeer.SNFH_SUCCESS_HANDLED:
               // Either lightweight or excessive request - all events are generated.
@@ -387,7 +393,9 @@ public class XComponentPeer extends XWindow implements ComponentPeer, DropTarget
                     ((Window)XToolkit.windowToXWindow(getWindow()).getToplevelXWindow().getTarget()).getClass().getName() +
             "; windowId : " + Long.toHexString(getWindow()));
 
-            WindowStateMachine.get().waitForNotifyAfterRaise(getWindow());
+            if (getTarget() instanceof javax.swing.Popup) {
+                WindowStateMachine.get().waitForNotifyAfterRaise(getWindow());
+            }
         }
         xSetVisible(b);
     }

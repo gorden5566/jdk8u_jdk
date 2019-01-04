@@ -67,7 +67,10 @@ const UINT MAX_ACP_STR_LEN = 7; // ANSI CP identifiers are no longer than this
 const int ALL_MK_BUTTONS = MK_LBUTTON|MK_MBUTTON|MK_RBUTTON;
 const int X_BUTTONS = MK_XBUTTON1|MK_XBUTTON2;
 
-
+// The allowable difference between coordinates of the WM_TOUCH event and the
+// corresponding WM_LBUTTONDOWN/WM_LBUTTONUP event letting to associate these
+// events, when their coordinates are slightly different.
+const int TOUCH_MOUSE_COORDS_DELTA = 10;
 
 // Whether to check for embedded frame and adjust location
 #define CHECK_EMBEDDED 0
@@ -185,10 +188,6 @@ public:
     INLINE int GetTextLength() { return ::GetWindowTextLength(GetHWnd()); }
 
     virtual void GetInsets(RECT* rect) {
-        VERIFY(::SetRectEmpty(rect));
-    }
-
-    virtual void GetAlignedInsets(RECT* rect) {
         VERIFY(::SetRectEmpty(rect));
     }
 
@@ -388,7 +387,7 @@ public:
     void SendMouseEvent(jint id, jlong when, jint x, jint y,
                         jint modifiers, jint clickCount,
                         jboolean popupTrigger, jint button = 0,
-                        MSG *msg = NULL);
+                        MSG *msg = NULL, BOOL causedByTouchEvent = FALSE);
 
     /*
      * Allocate and initialize a new java.awt.event.MouseWheelEvent, and
@@ -530,6 +529,7 @@ public:
     virtual MsgRouting WmNcMouseUp(WPARAM hitTest, int x, int y, int button);
     virtual MsgRouting WmWindowPosChanging(LPARAM windowPos);
     virtual MsgRouting WmWindowPosChanged(LPARAM windowPos);
+    virtual void WmTouch(WPARAM wParam, LPARAM lParam);
 
     // NB: 64-bit: vkey is wParam of the message, but other API's take
     // vkey parameters of type UINT, so we do the cast before dispatching.
@@ -673,6 +673,7 @@ public:
     static void _RemoveNativeDropTarget(void *param);
     static jintArray _CreatePrintedPixels(void *param);
     static jboolean _NativeHandlesWheelScrolling(void *param);
+    static void _SetParent(void * param);
     static void _SetRectangularShape(void *param);
     static void _SetZOrder(void *param);
 
@@ -732,6 +733,8 @@ public:
     int ScaleUpDY(int y);
     int ScaleDownDX(int x);
     int ScaleDownDY(int y);
+    void ScaleDownRect(RECT& r);
+    //void ScaleDownDRect(RECT& r);
 
 protected:
     static AwtComponent* GetComponentImpl(HWND hWnd);
@@ -745,6 +748,8 @@ protected:
 
     static BOOL sm_suppressFocusAndActivation;
     static BOOL sm_restoreFocusAndActivation;
+
+    INLINE BOOL IsInMoveResizeLoop() { return m_inMoveResizeLoop; }
 
     /*
      * The function sets the focus-restore flag ON/OFF.
@@ -772,6 +777,11 @@ private:
      * 2) no movement or drag has happened until RELEASE
     */
     UINT m_mouseButtonClickAllowed;
+
+    BOOL m_touchDownOccurred;
+    BOOL m_touchUpOccurred;
+    POINT m_touchDownPoint;
+    POINT m_touchUpPoint;
 
     BOOL m_bSubclassed;
     BOOL m_bPauseDestroy;
@@ -837,6 +847,8 @@ private:
     // 6524352: support finer-resolution
     int m_wheelRotationAmountX;
     int m_wheelRotationAmountY;
+
+    BOOL m_inMoveResizeLoop;
 
     BOOL deadKeyActive;
 

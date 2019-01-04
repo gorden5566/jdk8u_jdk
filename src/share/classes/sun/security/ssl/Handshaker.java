@@ -29,12 +29,6 @@ package sun.security.ssl;
 import java.io.*;
 import java.util.*;
 import java.security.*;
-import java.security.NoSuchAlgorithmException;
-import java.security.AccessController;
-import java.security.AlgorithmConstraints;
-import java.security.AccessControlContext;
-import java.security.PrivilegedExceptionAction;
-import java.security.PrivilegedActionException;
 
 import javax.crypto.*;
 import javax.crypto.spec.*;
@@ -124,10 +118,14 @@ abstract class Handshaker {
     HandshakeHash handshakeHash;
     HandshakeInStream input;
     HandshakeOutStream output;
-    int state;
     SSLContextImpl sslContext;
     RandomCookie clnt_random, svr_random;
     SSLSessionImpl session;
+    HandshakeStateManager handshakeState;
+    boolean clientHelloDelivered;
+    boolean serverHelloRequested;
+    boolean handshakeActivated;
+    boolean handshakeFinished;
 
     // current CipherSuite. Never null, initially SSL_NULL_WITH_NULL_NULL
     CipherSuite cipherSuite;
@@ -140,10 +138,6 @@ abstract class Handshaker {
 
     // True if it's OK to start a new SSL session
     boolean enableNewSession;
-
-    // True if session keys have been calculated and the caller may receive
-    // and process a ChangeCipherSpec message
-    private boolean sessKeysCalculated;
 
     // Whether local cipher suites preference should be honored during
     // handshaking?
@@ -204,8 +198,40 @@ abstract class Handshaker {
             Debug.getBooleanProperty(
                 "jdk.tls.rejectClientInitiatedRenegotiation", false);
 
+    // To switch off the extended_master_secret extension.
+    static final boolean useExtendedMasterSecret;
+
+    // Allow session resumption without Extended Master Secret extension.
+    static final boolean allowLegacyResumption =
+            Debug.getBooleanProperty("jdk.tls.allowLegacyResumption", true);
+
+    // Allow full handshake without Extended Master Secret extension.
+    static final boolean allowLegacyMasterSecret =
+            Debug.getBooleanProperty("jdk.tls.allowLegacyMasterSecret", true);
+
+    // Is it requested to use extended master secret extension?
+    boolean requestedToUseEMS = false;
+
     // need to dispose the object when it is invalidated
     boolean invalidated;
+
+    // Is the extended_master_secret extension supported?
+    static {
+        boolean supportExtendedMasterSecret = true;
+        try {
+            KeyGenerator kg =
+                JsseJce.getKeyGenerator("SunTlsExtendedMasterSecret");
+        } catch (NoSuchAlgorithmException nae) {
+            supportExtendedMasterSecret = false;
+        }
+
+        if (supportExtendedMasterSecret) {
+            useExtendedMasterSecret = Debug.getBooleanProperty(
+                    "jdk.tls.useExtendedMasterSecret", true);
+        } else {
+            useExtendedMasterSecret = false;
+        }
+    }
 
     Handshaker(SSLSocketImpl c, SSLContextImpl context,
             ProtocolList enabledProtocols, boolean needCertVerify,
@@ -216,7 +242,7 @@ abstract class Handshaker {
         init(context, enabledProtocols, needCertVerify, isClient,
             activeProtocolVersion, isInitialHandshake, secureRenegotiation,
             clientVerifyData, serverVerifyData);
-    }
+   }
 
     Handshaker(SSLEngineImpl engine, SSLContextImpl context,
             ProtocolList enabledProtocols, boolean needCertVerify,
@@ -251,9 +277,13 @@ abstract class Handshaker {
         this.secureRenegotiation = secureRenegotiation;
         this.clientVerifyData = clientVerifyData;
         this.serverVerifyData = serverVerifyData;
-        enableNewSession = true;
-        invalidated = false;
-        sessKeysCalculated = false;
+        this.enableNewSession = true;
+        this.invalidated = false;
+        this.handshakeState = new HandshakeStateManager();
+        this.clientHelloDelivered = false;
+        this.serverHelloRequested = false;
+        this.handshakeActivated = false;
+        this.handshakeFinished = false;
 
         setCipherSuite(CipherSuite.C_NULL);
         setEnabledProtocols(enabledProtocols);
@@ -263,22 +293,6 @@ abstract class Handshaker {
         } else {        // engine != null
             algorithmConstraints = new SSLAlgorithmConstraints(engine, true);
         }
-
-
-        //
-        // In addition to the connection state machine, controlling
-        // how the connection deals with the different sorts of records
-        // that get sent (notably handshake transitions!), there's
-        // also a handshaking state machine that controls message
-        // sequencing.
-        //
-        // It's a convenient artifact of the protocol that this can,
-        // with only a couple of minor exceptions, be driven by the
-        // type constant for the last message seen:  except for the
-        // client's cert verify, those constants are in a convenient
-        // order to drastically simplify state machine checking.
-        //
-        state = -2;  // initialized but not activated
     }
 
     /*
@@ -357,14 +371,6 @@ abstract class Handshaker {
             return conn.getAcc();
         } else {
             return engine.getAcc();
-        }
-    }
-
-    final boolean receivedChangeCipherSpec() {
-        if (conn != null) {
-            return conn.receivedChangeCipherSpec();
-        } else {
-            return engine.receivedChangeCipherSpec();
         }
     }
 
@@ -547,8 +553,7 @@ abstract class Handshaker {
             engine.outputRecord.setHelloVersion(helloVersion);
         }
 
-        // move state to activated
-        state = -1;
+        handshakeActivated = true;
     }
 
     /**
@@ -647,7 +652,7 @@ abstract class Handshaker {
                             boolean available = true;
                             if (suite.keyExchange.isEC) {
                                 if (!checkedCurves) {
-                                    hasCurves = SupportedEllipticCurvesExtension
+                                    hasCurves = EllipticCurvesExtension
                                         .hasActiveCurves(algorithmConstraints);
                                     checkedCurves = true;
 
@@ -738,7 +743,7 @@ abstract class Handshaker {
                             boolean available = true;
                             if (suite.keyExchange.isEC) {
                                 if (!checkedCurves) {
-                                    hasCurves = SupportedEllipticCurvesExtension
+                                    hasCurves = EllipticCurvesExtension
                                         .hasActiveCurves(algorithmConstraints);
                                     checkedCurves = true;
 
@@ -893,9 +898,8 @@ abstract class Handshaker {
      * this freshly created session can become the current one.
      */
     boolean isDone() {
-        return state == HandshakeMessage.ht_finished;
+        return started() && handshakeState.isEmpty() && handshakeFinished;
     }
-
 
     /*
      * Returns the session which was created through this
@@ -1002,6 +1006,13 @@ abstract class Handshaker {
                 return;
             }
 
+            // Set the flags in the message receiving side.
+            if (messageType == HandshakeMessage.ht_client_hello) {
+                clientHelloDelivered = true;
+            } else if (messageType == HandshakeMessage.ht_hello_request) {
+                serverHelloRequested = true;
+            }
+
             /*
              * Process the message.  We require
              * that processMessage() consumes the entire message.  In
@@ -1036,15 +1047,14 @@ abstract class Handshaker {
      * In activated state, the handshaker may not send any messages out.
      */
     boolean activated() {
-        return state >= -1;
+        return handshakeActivated;
     }
 
     /**
      * Returns true iff the handshaker has sent any messages.
      */
     boolean started() {
-        return state >= 0;  // 0: HandshakeMessage.ht_hello_request
-                            // 1: HandshakeMessage.ht_client_hello
+        return (serverHelloRequested || clientHelloDelivered);
     }
 
 
@@ -1054,11 +1064,13 @@ abstract class Handshaker {
      * the subclass returns.  NOP if handshaking's already started.
      */
     void kickstart() throws IOException {
-        if (state >= 0) {
+        if ((isClient && clientHelloDelivered) ||
+                (!isClient && serverHelloRequested)) {
             return;
         }
 
         HandshakeMessage m = getKickstartMessage();
+        handshakeState.update(m, resumingSession);
 
         if (debug != null && Debug.isOn("handshake")) {
             m.print(System.out);
@@ -1066,7 +1078,14 @@ abstract class Handshaker {
         m.write(output);
         output.flush();
 
-        state = m.messageType();
+        // Set the flags in the message delivering side.
+        int handshakeType = m.messageType();
+        if (handshakeType == HandshakeMessage.ht_hello_request) {
+            serverHelloRequested = true;
+        } else {        // HandshakeMessage.ht_client_hello
+            clientHelloDelivered = true;
+        }
+
     }
 
     /**
@@ -1098,16 +1117,6 @@ abstract class Handshaker {
 
         output.flush(); // i.e. handshake data
 
-        /*
-         * The write cipher state is protected by the connection write lock
-         * so we must grab it while making the change. We also
-         * make sure no writes occur between sending the ChangeCipherSpec
-         * message, installing the new cipher state, and sending the
-         * Finished message.
-         *
-         * We already hold SSLEngine/SSLSocket "this" by virtue
-         * of this being called from the readRecord code.
-         */
         OutputRecord r;
         if (conn != null) {
             r = new OutputRecord(Record.ct_change_cipher_spec);
@@ -1118,14 +1127,27 @@ abstract class Handshaker {
         r.setVersion(protocolVersion);
         r.write(1);     // single byte of data
 
+        /*
+         * The write cipher state is protected by the connection write lock
+         * so we must grab it while making the change. We also
+         * make sure no writes occur between sending the ChangeCipherSpec
+         * message, installing the new cipher state, and sending the
+         * Finished message.
+         *
+         * We already hold SSLEngine/SSLSocket "this" by virtue
+         * of this being called from the readRecord code.
+         */
         if (conn != null) {
             conn.writeLock.lock();
             try {
+                handshakeState.changeCipherSpec(false, isClient);
                 conn.writeRecord(r);
                 conn.changeWriteCiphers();
                 if (debug != null && Debug.isOn("handshake")) {
                     mesg.print(System.out);
                 }
+
+                handshakeState.update(mesg, resumingSession);
                 mesg.write(output);
                 output.flush();
             } finally {
@@ -1133,19 +1155,28 @@ abstract class Handshaker {
             }
         } else {
             synchronized (engine.writeLock) {
+                handshakeState.changeCipherSpec(false, isClient);
                 engine.writeRecord((EngineOutputRecord)r);
                 engine.changeWriteCiphers();
                 if (debug != null && Debug.isOn("handshake")) {
                     mesg.print(System.out);
                 }
-                mesg.write(output);
 
+                handshakeState.update(mesg, resumingSession);
+                mesg.write(output);
                 if (lastMessage) {
                     output.setFinishedMsg();
                 }
                 output.flush();
             }
         }
+        if (lastMessage) {
+            handshakeFinished = true;
+        }
+    }
+
+    void receiveChangeCipherSpec() throws IOException {
+        handshakeState.changeCipherSpec(true, isClient);
     }
 
     /*
@@ -1169,6 +1200,7 @@ abstract class Handshaker {
      * SHA1 hashes are of (different) constant strings, the pre-master
      * secret, and the nonces provided by the client and the server.
      */
+    @SuppressWarnings("deprecation")
     private SecretKey calculateMasterSecret(SecretKey preMasterSecret,
             ProtocolVersion requestedVersion) {
 
@@ -1200,10 +1232,34 @@ abstract class Handshaker {
         int prfHashLength = prf.getPRFHashLength();
         int prfBlockSize = prf.getPRFBlockSize();
 
-        TlsMasterSecretParameterSpec spec = new TlsMasterSecretParameterSpec(
-                preMasterSecret, protocolVersion.major, protocolVersion.minor,
-                clnt_random.random_bytes, svr_random.random_bytes,
-                prfHashAlg, prfHashLength, prfBlockSize);
+        TlsMasterSecretParameterSpec spec;
+        if (session.getUseExtendedMasterSecret()) {
+            // reset to use the extended master secret algorithm
+            masterAlg = "SunTlsExtendedMasterSecret";
+
+            byte[] sessionHash = null;
+            if (protocolVersion.v >= ProtocolVersion.TLS12.v) {
+                sessionHash = handshakeHash.getFinishedHash();
+            } else {
+                // TLS 1.0/1.1
+                sessionHash = new byte[36];
+                try {
+                    handshakeHash.getMD5Clone().digest(sessionHash, 0, 16);
+                    handshakeHash.getSHAClone().digest(sessionHash, 16, 20);
+                } catch (DigestException de) {
+                    throw new ProviderException(de);
+                }
+            }
+
+            spec = new TlsMasterSecretParameterSpec(
+                    preMasterSecret, protocolVersion.major, protocolVersion.minor,
+                    sessionHash, prfHashAlg, prfHashLength, prfBlockSize);
+        } else {
+            spec = new TlsMasterSecretParameterSpec(
+                    preMasterSecret, protocolVersion.major, protocolVersion.minor,
+                    clnt_random.random_bytes, svr_random.random_bytes,
+                    prfHashAlg, prfHashLength, prfBlockSize);
+        }
 
         try {
             KeyGenerator kg = JsseJce.getKeyGenerator(masterAlg);
@@ -1302,10 +1358,6 @@ abstract class Handshaker {
             throw new ProviderException(e);
         }
 
-        // Mark a flag that allows outside entities (like SSLSocket/SSLEngine)
-        // determine if a ChangeCipherSpec message could be processed.
-        sessKeysCalculated = true;
-
         //
         // Dump the connection keys as they're generated.
         //
@@ -1358,15 +1410,6 @@ abstract class Handshaker {
                 System.out.flush();
             }
         }
-    }
-
-    /**
-     * Return whether or not the Handshaker has derived session keys for
-     * this handshake.  This is used for determining readiness to process
-     * an incoming ChangeCipherSpec message.
-     */
-    boolean sessionKeysCalculated() {
-        return sessKeysCalculated;
     }
 
     private static void printHex(HexDumpEncoder dump, byte[] bytes) {

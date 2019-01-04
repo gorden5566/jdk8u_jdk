@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 1996, 2016, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 1996, 2018, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -43,6 +43,7 @@ import java.util.concurrent.ConcurrentMap;
 
 import static java.io.ObjectStreamClass.processQueue;
 
+import sun.misc.SharedSecrets;
 import sun.misc.ObjectInputFilter;
 import sun.misc.ObjectStreamClassValidator;
 import sun.misc.SharedSecrets;
@@ -246,7 +247,7 @@ public class ObjectInputStream
 
     static {
         /* Setup access so sun.misc can invoke package private functions. */
-        sun.misc.SharedSecrets.setJavaOISAccess(new JavaOISAccess() {
+        JavaOISAccess javaOISAccess = new JavaOISAccess() {
             public void setObjectInputFilter(ObjectInputStream stream, ObjectInputFilter filter) {
                 stream.setInternalObjectInputFilter(filter);
             }
@@ -254,7 +255,15 @@ public class ObjectInputStream
             public ObjectInputFilter getObjectInputFilter(ObjectInputStream stream) {
                 return stream.getInternalObjectInputFilter();
             }
-        });
+
+            public void checkArray(ObjectInputStream stream, Class<?> arrayType, int arrayLength)
+                throws InvalidClassException
+            {
+                stream.checkArray(arrayType, arrayLength);
+            }
+        };
+
+        sun.misc.SharedSecrets.setJavaOISAccess(javaOISAccess);
     }
 
     /*
@@ -1224,9 +1233,11 @@ public class ObjectInputStream
         if (serialFilter != null) {
             RuntimeException ex = null;
             ObjectInputFilter.Status status;
+            // Info about the stream is not available if overridden by subclass, return 0
+            long bytesRead = (bin == null) ? 0 : bin.getBytesRead();
             try {
                 status = serialFilter.checkInput(new FilterValues(clazz, arrayLength,
-                        totalObjectRefs, depth, bin.getBytesRead()));
+                        totalObjectRefs, depth, bytesRead));
             } catch (RuntimeException e) {
                 // Preventive interception of an exception to log
                 status = ObjectInputFilter.Status.REJECTED;
@@ -1238,7 +1249,7 @@ public class ObjectInputStream
                 if (Logging.infoLogger != null) {
                     Logging.infoLogger.info(
                             "ObjectInputFilter {0}: {1}, array length: {2}, nRefs: {3}, depth: {4}, bytes: {5}, ex: {6}",
-                            status, clazz, arrayLength, totalObjectRefs, depth, bin.getBytesRead(),
+                            status, clazz, arrayLength, totalObjectRefs, depth, bytesRead,
                             Objects.toString(ex, "n/a"));
                 }
                 InvalidClassException ice = new InvalidClassException("filter status: " + status);
@@ -1249,11 +1260,38 @@ public class ObjectInputStream
                 if (Logging.traceLogger != null) {
                     Logging.traceLogger.finer(
                             "ObjectInputFilter {0}: {1}, array length: {2}, nRefs: {3}, depth: {4}, bytes: {5}, ex: {6}",
-                            status, clazz, arrayLength, totalObjectRefs, depth, bin.getBytesRead(),
+                            status, clazz, arrayLength, totalObjectRefs, depth, bytesRead,
                             Objects.toString(ex, "n/a"));
                 }
             }
         }
+    }
+
+    /**
+     * Checks the given array type and length to ensure that creation of such
+     * an array is permitted by this ObjectInputStream. The arrayType argument
+     * must represent an actual array type.
+     *
+     * This private method is called via SharedSecrets.
+     *
+     * @param arrayType the array type
+     * @param arrayLength the array length
+     * @throws NullPointerException if arrayType is null
+     * @throws IllegalArgumentException if arrayType isn't actually an array type
+     * @throws NegativeArraySizeException if arrayLength is negative
+     * @throws InvalidClassException if the filter rejects creation
+     */
+    private void checkArray(Class<?> arrayType, int arrayLength) throws InvalidClassException {
+        Objects.requireNonNull(arrayType);
+        if (! arrayType.isArray()) {
+            throw new IllegalArgumentException("not an array type");
+        }
+
+        if (arrayLength < 0) {
+            throw new NegativeArraySizeException();
+        }
+
+        filterCheck(arrayType, arrayLength);
     }
 
     /**
@@ -1746,6 +1784,10 @@ public class ObjectInputStream
         passHandle = NULL_HANDLE;
 
         int numIfaces = bin.readInt();
+        if (numIfaces > 65535) {
+            throw new InvalidObjectException("interface limit exceeded: "
+                    + numIfaces);
+        }
         String[] ifaces = new String[numIfaces];
         for (int i = 0; i < numIfaces; i++) {
             ifaces[i] = bin.readUTF();
@@ -1774,12 +1816,19 @@ public class ObjectInputStream
         } catch (ClassNotFoundException ex) {
             resolveEx = ex;
         }
+
+        // Call filterCheck on the class before reading anything else
+        filterCheck(cl, -1);
+
         skipCustomData();
 
-        desc.initProxy(cl, resolveEx, readClassDesc(false));
-
-        // Call filterCheck on the definition
-        filterCheck(desc.forClass(), -1);
+        try {
+            totalObjectRefs++;
+            depth++;
+            desc.initProxy(cl, resolveEx, readClassDesc(false));
+        } finally {
+            depth--;
+        }
 
         handles.finish(descHandle);
         passHandle = descHandle;
@@ -1824,12 +1873,19 @@ public class ObjectInputStream
         } catch (ClassNotFoundException ex) {
             resolveEx = ex;
         }
+
+        // Call filterCheck on the class before reading anything else
+        filterCheck(cl, -1);
+
         skipCustomData();
 
-        desc.initNonProxy(readDesc, cl, resolveEx, readClassDesc(false));
-
-        // Call filterCheck on the definition
-        filterCheck(desc.forClass(), -1);
+        try {
+            totalObjectRefs++;
+            depth++;
+            desc.initNonProxy(readDesc, cl, resolveEx, readClassDesc(false));
+        } finally {
+            depth--;
+        }
 
         handles.finish(descHandle);
         passHandle = descHandle;
@@ -2282,10 +2338,11 @@ public class ObjectInputStream
                                               int ndoubles);
 
     /**
-     * Returns the first non-null class loader (not counting class loaders of
-     * generated reflection implementation classes) up the execution stack, or
-     * null if only code from the null class loader is on the stack.  This
-     * method is also called via reflection by the following RMI-IIOP class:
+     * Returns first non-privileged class loader on the stack (excluding
+     * reflection generated frames) or the extension class loader if only
+     * class loaded by the boot class loader and extension class loader are
+     * found on the stack. This method is also called via reflection by the
+     * following RMI-IIOP class:
      *
      *     com.sun.corba.se.internal.util.JDKClassLoader
      *

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 1996, 2014, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 1996, 2017, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -52,6 +52,7 @@
 #include <Region.h>
 
 #include <jawt.h>
+#include <math.h>
 
 #include <java_awt_Toolkit.h>
 #include <java_awt_FontMetrics.h>
@@ -136,8 +137,8 @@ struct SetRectangularShapeStruct {
     jint x1, x2, y1, y2;
     jobject region;
 };
-// Struct for _GetAlignedInsets function
-struct GetAlignedInsetsStruct {
+// Struct for _GetInsets function
+struct GetInsetsStruct {
     jobject window;
     RECT *insets;
 };
@@ -232,6 +233,10 @@ JNIEXPORT void JNICALL Java_sun_awt_windows_WComponentPeer_setPlatformScrollingF
 AwtComponent::AwtComponent()
 {
     m_mouseButtonClickAllowed = 0;
+    m_touchDownOccurred = FALSE;
+    m_touchUpOccurred = FALSE;
+    m_touchDownPoint.x = m_touchDownPoint.y = 0;
+    m_touchUpPoint.x = m_touchUpPoint.y = 0;
     m_callbacksEnabled = FALSE;
     m_hwnd = NULL;
 
@@ -280,9 +285,6 @@ AwtComponent::~AwtComponent()
 {
     DASSERT(AwtToolkit::IsMainThread());
 
-    /* Disconnect all links. */
-    UnlinkObjects();
-
     /*
      * All the messages for this component are processed, native
      * resources are freed, and Java object is not connected to
@@ -294,6 +296,8 @@ AwtComponent::~AwtComponent()
 
 void AwtComponent::Dispose()
 {
+    DASSERT(AwtToolkit::IsMainThread());
+
     // NOTE: in case the component/toplevel was focused, Java should
     // have already taken care of proper transferring it or clearing.
 
@@ -312,8 +316,10 @@ void AwtComponent::Dispose()
     /* Release global ref to input method */
     SetInputMethod(NULL, TRUE);
 
-    if (m_childList != NULL)
+    if (m_childList != NULL) {
         delete m_childList;
+        m_childList = NULL;
+    }
 
     DestroyDropTarget();
     ReleaseDragCapture(0);
@@ -335,6 +341,9 @@ void AwtComponent::Dispose()
         m_brushBackground->Release();
         m_brushBackground = NULL;
     }
+
+    /* Disconnect all links. */
+    UnlinkObjects();
 
     if (m_bPauseDestroy) {
         // AwtComponent::WmNcDestroy could be released now
@@ -596,6 +605,11 @@ AwtComponent::CreateHWnd(JNIEnv *env, LPCWSTR title,
 
     /* Subclass the window now so that we can snoop on its messages */
     SubclassHWND();
+
+    AwtToolkit& tk = AwtToolkit::GetInstance();
+    if (tk.IsWin8OrLater() && tk.IsTouchKeyboardAutoShowEnabled()) {
+        tk.TIRegisterTouchWindow(GetHWnd(), TWF_WANTPALM);
+    }
 
     /*
       * Fix for 4046446.
@@ -975,6 +989,9 @@ void AwtComponent::Reshape(int x, int y, int w, int h)
     DTRACE_PRINTLN4("AwtComponent::Reshape from %d, %d, %d, %d", rc.left, rc.top, rc.right-rc.left, rc.bottom-rc.top);
 #endif
 
+    int usrX = x;
+    int usrY = y;
+
     AwtWin32GraphicsDevice* device = AwtWin32GraphicsDevice::GetDeviceByBounds(RECT_BOUNDS(x, y, w, h), GetHWnd());
     x = device->ScaleUpDX(x);
     y = device->ScaleUpDY(y);
@@ -984,35 +1001,42 @@ void AwtComponent::Reshape(int x, int y, int w, int h)
     AwtWindow* container = GetContainer();
     AwtComponent* parent = GetParent();
 
-    // The on-screen location of a component is affected by its toplevel. The toplvel's location in user space
-    // is represented with some loss of precision - the result of device->ScaleDownXY is ceil'ed. For instance,
-    // say we have scale 2.0 and a toplevel displayed at [13, 7] in device space. This location is translated to
-    // [7, 4] in user space. Were the toplevel moved to [14, 8] its location would still be translated to [7, 4]
-    // in user space. One of the problems caused by this fact is the problem of positioning of an owned window
-    // relative to its owner (or to the owner's content). Until we have a floating point API for managing Component
-    // bounds the following workaround is suggested. When a window with non-empty owner is positioned on the device,
-    // the component of the owner's position coordinate which is lost (as the fractional component) on translation to
-    // user space should be used to adjust the owned window position. For the example above this would be:
-    // [13, 7] is translated to [7, 4], the lost component is [1, 1]. So if one wants to display an owned window at,
-    // say, [11, 9] in user space, which is translated to [22, 18] on the device, the windows' position should be
-    // adjusted by [1, 1] (the owner's position lost component). Thus the result would be: [22, 18] - [1, 1] = [21, 17].
-    // The same formula works for fractional scale factors.
+    // [tav] Handle the fact that an owned window is most likely positioned relative to its owner, and it may
+    // require pixel-perfect alignment. For that, compensate rounding errors (caused by converting from the device
+    // space to the integer user space and back) for the owner's origin and for the owner's client area origin.
     if (IsTopLevel() && parent != NULL &&
         (device->GetScaleX() > 1 || device->GetScaleY() > 1))
     {
-        RECT rect;
-        VERIFY(::GetWindowRect(parent->GetHWnd(), &rect));
-        int xOffset = /*ceil'd*/device->ScaleUpDX(device->ScaleDownDX(rect.left)) - rect.left;
-        int yOffset = /*ceil'd*/device->ScaleUpDY(device->ScaleDownDY(rect.top)) - rect.top;
-        int newX = x - xOffset;
-        int newY = y - yOffset;
+        RECT parentInsets;
+        parent->GetInsets(&parentInsets);
+        // Convert the owner's client area origin to user space
+        int parentInsetsUsrX = device->ScaleDownX(parentInsets.left);
+        int parentInsetsUsrY = device->ScaleDownY(parentInsets.top);
+
+        RECT parentRect;
+        VERIFY(::GetWindowRect(parent->GetHWnd(), &parentRect));
+        // Convert the owner's origin to user space
+        int parentUsrX = device->ScaleDownDX(parentRect.left);
+        int parentUsrY = device->ScaleDownDY(parentRect.top);
+
+        // Calc the offset from the owner's client area in user space
+        int offsetUsrX = usrX - parentUsrX - parentInsetsUsrX;
+        int offsetUsrY = usrY - parentUsrY - parentInsetsUsrY;
+
+        // Convert the offset to device space
+        int offsetDevX = device->ScaleUpX(offsetUsrX);
+        int offsetDevY = device->ScaleUpY(offsetUsrY);
+
+        // Finally calc the window's location based on the frame's and its insets system numbers.
+        int devX = parentRect.left + parentInsets.left + offsetDevX;
+        int devY = parentRect.top + parentInsets.top + offsetDevY;
 
         // Check the toplevel is not going to be moved to another screen.
-        ::SetRect(&rect, newX, newY, newX + w, newY + h);
-        HMONITOR hmon = ::MonitorFromRect(&rect, MONITOR_DEFAULTTONEAREST);
+        ::SetRect(&parentRect, devX, devY, devX + w, devY + h);
+        HMONITOR hmon = ::MonitorFromRect(&parentRect, MONITOR_DEFAULTTONEAREST);
         if (hmon != NULL && AwtWin32GraphicsDevice::GetScreenFromHMONITOR(hmon) == device->GetDeviceIndex()) {
-            x = newX;
-            y = newY;
+            x = devX;
+            y = devY;
         }
     }
 
@@ -1548,6 +1572,12 @@ LRESULT AwtComponent::WindowProc(UINT message, WPARAM wParam, LPARAM lParam)
           SetCompositionWindow(r);
           break;
       }
+      case WM_ENTERSIZEMOVE:
+      {
+          m_inMoveResizeLoop = TRUE;
+          mr = mrDoDefault;
+          break;
+      }
       case WM_SIZING:
           mr = WmSizing();
           break;
@@ -1559,6 +1589,7 @@ LRESULT AwtComponent::WindowProc(UINT message, WPARAM wParam, LPARAM lParam)
                             GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
           break;
       case WM_EXITSIZEMOVE:
+          m_inMoveResizeLoop = FALSE;
           mr = WmExitSizeMove();
           break;
       // Bug #4039858 (Selecting menu item causes bogus mouse click event)
@@ -1763,6 +1794,9 @@ LRESULT AwtComponent::WindowProc(UINT message, WPARAM wParam, LPARAM lParam)
               break;
           }
           break;
+      case WM_TOUCH:
+          WmTouch(wParam, lParam);
+          break;
       case WM_SETCURSOR:
           mr = mrDoDefault;
           if (LOWORD(lParam) == HTCLIENT) {
@@ -1857,6 +1891,7 @@ LRESULT AwtComponent::WindowProc(UINT message, WPARAM wParam, LPARAM lParam)
                           "new = 0x%08X",
                           GetHWnd(), GetClassName(), (UINT)lParam);
           mr = WmInputLangChange(static_cast<UINT>(wParam), reinterpret_cast<HKL>(lParam));
+          g_bUserHasChangedInputLang = TRUE;
           CallProxyDefWindowProc(message, wParam, lParam, retValue, mr);
           // should return non-zero if we process this message
           retValue = 1;
@@ -2279,8 +2314,8 @@ void AwtComponent::PaintUpdateRgn(const RECT *insets)
          */
         RECT* r = (RECT*)(buffer + rgndata->rdh.dwSize);
         RECT* un[2] = {0, 0};
-    DWORD i;
-    for (i = 0; i < rgndata->rdh.nCount; i++, r++) {
+        DWORD i;
+        for (i = 0; i < rgndata->rdh.nCount; i++, r++) {
             int width = r->right-r->left;
             int height = r->bottom-r->top;
             if (width > 0 && height > 0) {
@@ -2294,11 +2329,12 @@ void AwtComponent::PaintUpdateRgn(const RECT *insets)
         }
         for(i = 0; i < 2; i++) {
             if (un[i] != 0) {
+                ScaleDownRect(*un[i]);
                 DoCallback("handleExpose", "(IIII)V",
-                           ScaleDownX(un[i]->left),
-                           ScaleDownY(un[i]->top),
-                           ScaleDownX(un[i]->right - un[i]->left),
-                           ScaleDownY(un[i]->bottom - un[i]->top));
+                           un[i]->left,
+                           un[i]->top,
+                           un[i]->right - un[i]->left,
+                           un[i]->bottom - un[i]->top);
             }
         }
         delete [] buffer;
@@ -2363,6 +2399,38 @@ MsgRouting AwtComponent::WmWindowPosChanged(LPARAM windowPos) {
     return mrDoDefault;
 }
 
+void AwtComponent::WmTouch(WPARAM wParam, LPARAM lParam) {
+    AwtToolkit& tk = AwtToolkit::GetInstance();
+    if (!tk.IsWin8OrLater() || !tk.IsTouchKeyboardAutoShowEnabled()) {
+        return;
+    }
+
+    UINT inputsCount = LOWORD(wParam);
+    TOUCHINPUT* pInputs = new TOUCHINPUT[inputsCount];
+    if (pInputs != NULL) {
+        if (tk.TIGetTouchInputInfo((HTOUCHINPUT)lParam, inputsCount, pInputs,
+                sizeof(TOUCHINPUT)) != 0) {
+            for (UINT i = 0; i < inputsCount; i++) {
+                TOUCHINPUT ti = pInputs[i];
+                if (ti.dwFlags & TOUCHEVENTF_PRIMARY) {
+                    if (ti.dwFlags & TOUCHEVENTF_DOWN) {
+                        m_touchDownPoint.x = ti.x / 100;
+                        m_touchDownPoint.y = ti.y / 100;
+                        ::ScreenToClient(GetHWnd(), &m_touchDownPoint);
+                        m_touchDownOccurred = TRUE;
+                    } else if (ti.dwFlags & TOUCHEVENTF_UP) {
+                        m_touchUpPoint.x = ti.x / 100;
+                        m_touchUpPoint.y = ti.y / 100;
+                        ::ScreenToClient(GetHWnd(), &m_touchUpPoint);
+                        m_touchUpOccurred = TRUE;
+                    }
+                }
+            }
+        }
+        delete[] pInputs;
+    }
+}
+
 /* Double-click variables. */
 static jlong multiClickTime = ::GetDoubleClickTime();
 static int multiClickMaxX = ::GetSystemMetrics(SM_CXDOUBLECLK);
@@ -2405,6 +2473,14 @@ MsgRouting AwtComponent::WmMouseDown(UINT flags, int x, int y, int button)
     m_mouseButtonClickAllowed |= GetButtonMK(button);
     lastTime = now;
 
+    BOOL causedByTouchEvent = FALSE;
+    if (m_touchDownOccurred &&
+        (abs(m_touchDownPoint.x - x) <= TOUCH_MOUSE_COORDS_DELTA) &&
+        (abs(m_touchDownPoint.y - y) <= TOUCH_MOUSE_COORDS_DELTA)) {
+        causedByTouchEvent = TRUE;
+        m_touchDownOccurred = FALSE;
+    }
+
     MSG msg;
     InitMessage(&msg, lastMessage, flags, MAKELPARAM(x, y), x, y);
 
@@ -2423,7 +2499,7 @@ MsgRouting AwtComponent::WmMouseDown(UINT flags, int x, int y, int button)
 
     SendMouseEvent(java_awt_event_MouseEvent_MOUSE_PRESSED, now, x, y,
                    GetJavaModifiers(), clickCount, JNI_FALSE,
-                   GetButton(button), &msg);
+                   GetButton(button), &msg, causedByTouchEvent);
     /*
      * NOTE: this call is intentionally placed after all other code,
      * since AwtComponent::WmMouseDown() assumes that the cached id of the
@@ -2445,13 +2521,21 @@ MsgRouting AwtComponent::WmMouseDown(UINT flags, int x, int y, int button)
 
 MsgRouting AwtComponent::WmMouseUp(UINT flags, int x, int y, int button)
 {
+    BOOL causedByTouchEvent = FALSE;
+    if (m_touchUpOccurred &&
+        (abs(m_touchUpPoint.x - x) <= TOUCH_MOUSE_COORDS_DELTA) &&
+        (abs(m_touchUpPoint.y - y) <= TOUCH_MOUSE_COORDS_DELTA)) {
+        causedByTouchEvent = TRUE;
+        m_touchUpOccurred = FALSE;
+    }
+
     MSG msg;
     InitMessage(&msg, lastMessage, flags, MAKELPARAM(x, y), x, y);
 
     SendMouseEvent(java_awt_event_MouseEvent_MOUSE_RELEASED, TimeHelper::getMessageTimeUTC(),
                    x, y, GetJavaModifiers(), clickCount,
                    (GetButton(button) == java_awt_event_MouseEvent_BUTTON3 ?
-                    TRUE : FALSE), GetButton(button), &msg);
+                    TRUE : FALSE), GetButton(button), &msg, causedByTouchEvent);
     /*
      * If no movement, then report a click following the button release.
      * When WM_MOUSEUP comes to a window without previous WM_MOUSEDOWN,
@@ -3853,18 +3937,18 @@ void AwtComponent::OpenCandidateWindow(int x, int y)
 {
     UINT bits = 1;
     POINT p = {0, 0}; // upper left corner of the client area
-    HWND hWnd = GetHWnd();
+    HWND hWnd = ImmGetHWnd();
     HWND hTop = GetTopLevelParentForWindow(hWnd);
     ::ClientToScreen(hTop, &p);
-
+    int sx = ScaleUpDX(x) - p.x;
+    int sy = ScaleUpDY(y) - p.y;
+    if (!m_bitsCandType) {
+        SetCandidateWindow(m_bitsCandType, sx, sy);
+        return;
+    }
     for (int iCandType=0; iCandType<32; iCandType++, bits<<=1) {
         if ( m_bitsCandType & bits )
-            SetCandidateWindow(iCandType, x - p.x, y - p.y);
-    }
-    if (m_bitsCandType != 0) {
-        // REMIND: is there any chance GetProxyFocusOwner() returns NULL here?
-        ::DefWindowProc(ImmGetHWnd(),
-                        WM_IME_NOTIFY, IMN_OPENCANDIDATE, m_bitsCandType);
+            SetCandidateWindow(iCandType, sx, sy);
     }
 }
 
@@ -3872,14 +3956,30 @@ void AwtComponent::SetCandidateWindow(int iCandType, int x, int y)
 {
     HWND hwnd = ImmGetHWnd();
     HIMC hIMC = ImmGetContext(hwnd);
-    CANDIDATEFORM cf;
-    cf.dwIndex = iCandType;
-    cf.dwStyle = CFS_CANDIDATEPOS;
-    cf.ptCurrentPos.x = x;
-    cf.ptCurrentPos.y = y;
-
-    ImmSetCandidateWindow(hIMC, &cf);
-    ImmReleaseContext(hwnd, hIMC);
+    if (hIMC) {
+        CANDIDATEFORM cf;
+        cf.dwStyle = CFS_POINT;
+        ImmGetCandidateWindow(hIMC, 0, &cf);
+        if (x != cf.ptCurrentPos.x || y != cf.ptCurrentPos.y) {
+            cf.dwIndex = iCandType;
+            cf.dwStyle = CFS_POINT;
+            cf.ptCurrentPos.x = x;
+            cf.ptCurrentPos.y = y;
+            cf.rcArea.left = cf.rcArea.top = cf.rcArea.right = cf.rcArea.bottom = 0;
+            ImmSetCandidateWindow(hIMC, &cf);
+        }
+        COMPOSITIONFORM cfr;
+        cfr.dwStyle = CFS_POINT;
+        ImmGetCompositionWindow(hIMC, &cfr);
+        if (x != cfr.ptCurrentPos.x || y != cfr.ptCurrentPos.y) {
+            cfr.dwStyle = CFS_POINT;
+            cfr.ptCurrentPos.x = x;
+            cfr.ptCurrentPos.y = y;
+            cfr.rcArea.left = cfr.rcArea.top = cfr.rcArea.right = cfr.rcArea.bottom = 0;
+            ImmSetCompositionWindow(hIMC, &cfr);
+        }
+        ImmReleaseContext(hwnd, hIMC);
+    }
 }
 
 MsgRouting AwtComponent::WmImeSetContext(BOOL fSet, LPARAM *lplParam)
@@ -3906,10 +4006,15 @@ MsgRouting AwtComponent::WmImeSetContext(BOOL fSet, LPARAM *lplParam)
 
 MsgRouting AwtComponent::WmImeNotify(WPARAM subMsg, LPARAM bitsCandType)
 {
-    if (!m_useNativeCompWindow && subMsg == IMN_OPENCANDIDATE) {
-        m_bitsCandType = bitsCandType;
-        InquireCandidatePosition();
-        return mrConsume;
+    if (!m_useNativeCompWindow) {
+        if (subMsg == IMN_OPENCANDIDATE || subMsg == IMN_CHANGECANDIDATE) {
+            m_bitsCandType = bitsCandType;
+            InquireCandidatePosition();
+        } else if (subMsg == IMN_OPENSTATUSWINDOW ||
+                   subMsg == WM_IME_STARTCOMPOSITION ||
+                   subMsg == IMN_SETCANDIDATEPOS) {
+            InquireCandidatePosition();
+        }
     }
     return mrDoDefault;
 }
@@ -4168,14 +4273,14 @@ HWND AwtComponent::GetProxyFocusOwner()
     return (HWND)NULL;
 }
 
-/* Call DefWindowProc for the focus proxy, if any */
+/* Redirects message to the focus proxy, if any */
 void AwtComponent::CallProxyDefWindowProc(UINT message, WPARAM wParam,
     LPARAM lParam, LRESULT &retVal, MsgRouting &mr)
 {
     if (mr != mrConsume)  {
         HWND proxy = GetProxyFocusOwner();
         if (proxy != NULL && ::IsWindowEnabled(proxy)) {
-            retVal = ComCtl32Util::GetInstance().DefWindowProc(NULL, proxy, message, wParam, lParam);
+            retVal = ::DefWindowProc(proxy, message, wParam, lParam);
             mr = mrConsume;
         }
     }
@@ -4768,6 +4873,16 @@ int AwtComponent::ScaleDownDY(int y) {
     return device == NULL ? y : device->ScaleDownDY(y);
 }
 
+void AwtComponent::ScaleDownRect(RECT& r) {
+    int screen = AwtWin32GraphicsDevice::DeviceIndexForWindow(GetHWnd());
+    Devices::InstanceAccess devices;
+    AwtWin32GraphicsDevice* device = devices->GetDevice(screen);
+    if (device == NULL) return;
+    float sx = device->GetScaleX();
+    float sy = device->GetScaleY();
+    ::SetRect(&r, floor(r.left / sx), floor(r.top / sy), ceil(r.right / sx), ceil(r.bottom / sy));
+}
+
 jintArray AwtComponent::CreatePrintedPixels(SIZE &loc, SIZE &size, int alpha) {
     JNIEnv *env = (JNIEnv *)JNU_GetEnv(jvm, JNI_VERSION_1_2);
 
@@ -5023,7 +5138,7 @@ void AwtComponent::ReleaseDragCapture(UINT flags)
 void AwtComponent::SendMouseEvent(jint id, jlong when, jint x, jint y,
                                   jint modifiers, jint clickCount,
                                   jboolean popupTrigger, jint button,
-                                  MSG *pMsg)
+                                  MSG *pMsg, BOOL causedByTouchEvent)
 {
     JNIEnv *env = (JNIEnv *)JNU_GetEnv(jvm, JNI_VERSION_1_2);
     CriticalSection::Lock l(GetLock());
@@ -6438,11 +6553,11 @@ AwtComponent_GetHWnd(JNIEnv *env, jlong pData)
     return p->GetHWnd();
 }
 
-static void _GetAlignedInsets(void* param)
+static void _GetInsets(void* param)
 {
     JNIEnv *env = (JNIEnv *)JNU_GetEnv(jvm, JNI_VERSION_1_2);
 
-    GetAlignedInsetsStruct *gis = (GetAlignedInsetsStruct *)param;
+    GetInsetsStruct *gis = (GetInsetsStruct *)param;
     jobject self = gis->window;
 
     gis->insets->left = gis->insets->top =
@@ -6452,7 +6567,7 @@ static void _GetAlignedInsets(void* param)
     JNI_CHECK_PEER_GOTO(self, ret);
     AwtComponent *component = (AwtComponent *)pData;
 
-    component->GetAlignedInsets(gis->insets);
+    component->GetInsets(gis->insets);
 
   ret:
     env->DeleteGlobalRef(self);
@@ -6463,15 +6578,15 @@ static void _GetAlignedInsets(void* param)
  * This method is called from the WGL pipeline when it needs to retrieve
  * the insets associated with a ComponentPeer's C++ level object.
  */
-void AwtComponent_GetAlignedInsets(JNIEnv *env, jobject peer, RECT *insets)
+void AwtComponent_GetInsets(JNIEnv *env, jobject peer, RECT *insets)
 {
     TRY;
 
-    GetAlignedInsetsStruct *gis = new GetAlignedInsetsStruct;
+    GetInsetsStruct *gis = new GetInsetsStruct;
     gis->window = env->NewGlobalRef(peer);
     gis->insets = insets;
 
-    AwtToolkit::GetInstance().InvokeFunction(_GetAlignedInsets, gis);
+    AwtToolkit::GetInstance().InvokeFunction(_GetInsets, gis);
     // global refs and mds are deleted in _UpdateWindow
 
     CATCH_BAD_ALLOC;
